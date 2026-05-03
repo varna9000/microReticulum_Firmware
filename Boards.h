@@ -459,7 +459,7 @@
       #undef HAS_BLE
       #define HAS_BLE true
       #define HAS_CONSOLE false
-      #define HAS_PMU false
+      #define HAS_PMU true
       #define HAS_NP false
       #define HAS_SD false
       #undef HAS_TCXO

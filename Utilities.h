@@ -15,16 +15,102 @@
 
 #include "Config.h"
 
-#if HAS_EEPROM 
+#if HAS_EEPROM
     #include <EEPROM.h>
 #elif PLATFORM == PLATFORM_NRF52
     #include <Adafruit_LittleFS.h>
     #include <InternalFileSystem.h>
     using namespace Adafruit_LittleFS_Namespace;
-    #define EEPROM_FILE "eeprom"
-    bool file_exists = false;
-    int written_bytes = 4;
-    File file(InternalFS);
+    #define EEPROM_FILE_LEGACY   "eeprom"
+    #define EEPROM_FILE_ROM      "eeprom_rom"
+    #define EEPROM_FILE_CONF     "eeprom_conf"
+    #define EEPROM_FILE_DEFAULTS "eeprom_defaults"
+    int written_bytes_rom = 0;
+    int written_bytes_conf = 0;
+    File file_rom(InternalFS);
+    File file_conf(InternalFS);
+    File file_defaults(InternalFS);
+
+    // Raw flash page for EEPROM backup (one 4KB page before LittleFS at 0xED000)
+    // Used for auto-recovery when LittleFS is corrupted by power loss
+    #define EEPROM_BACKUP_ADDR 0xEC000
+
+    // Raw flash backup functions (flash_nrf5x is compiled as part of InternalFileSystem)
+    extern "C" {
+        void flash_nrf5x_flush(void);
+        bool flash_nrf5x_erase(uint32_t addr);
+        int  flash_nrf5x_write(uint32_t dst, void const* src, uint32_t len);
+    }
+
+    #define EEPROM_BACKUP_MAGIC_0 'R'
+    #define EEPROM_BACKUP_MAGIC_1 'N'
+    #define EEPROM_BACKUP_MAGIC_2 'B'
+    #define EEPROM_BACKUP_MAGIC_3 'K'
+    #define EEPROM_BACKUP_HEADER_SIZE 8
+    // Layout: [magic 4B][version 1B][reserved 3B][ROM EEPROM_SIZE B][CONF EEPROM_SIZE B][checksum 2B]
+
+    bool eeprom_backup_valid() {
+        const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
+        return (p[0] == EEPROM_BACKUP_MAGIC_0 && p[1] == EEPROM_BACKUP_MAGIC_1 &&
+                p[2] == EEPROM_BACKUP_MAGIC_2 && p[3] == EEPROM_BACKUP_MAGIC_3);
+    }
+
+    bool eeprom_read_backup(uint8_t* rom_out, uint8_t* conf_out) {
+        const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
+
+        // Verify magic
+        if (!eeprom_backup_valid()) return false;
+
+        uint16_t total = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
+
+        // Verify checksum
+        uint16_t sum = 0;
+        for (uint16_t i = 0; i < total; i++) sum += p[i];
+        uint16_t stored = p[total] | (p[total + 1] << 8);
+        if (sum != stored) {
+            Serial.println("[EEPROM] Backup checksum mismatch");
+            return false;
+        }
+
+        memcpy(rom_out, p + EEPROM_BACKUP_HEADER_SIZE, EEPROM_SIZE);
+        memcpy(conf_out, p + EEPROM_BACKUP_HEADER_SIZE + EEPROM_SIZE, EEPROM_SIZE);
+        return true;
+    }
+
+    void eeprom_write_backup() {
+        uint16_t total = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
+        uint8_t buf[total + 2]; // +2 for checksum
+
+        // Header
+        buf[0] = EEPROM_BACKUP_MAGIC_0;
+        buf[1] = EEPROM_BACKUP_MAGIC_1;
+        buf[2] = EEPROM_BACKUP_MAGIC_2;
+        buf[3] = EEPROM_BACKUP_MAGIC_3;
+        buf[4] = 0x01; // version
+        buf[5] = 0x00; // reserved
+        buf[6] = 0x00;
+        buf[7] = 0x00;
+
+        // Read current ROM data from file
+        file_rom.seek(0);
+        file_rom.read(buf + EEPROM_BACKUP_HEADER_SIZE, EEPROM_SIZE);
+
+        // Read current CONF data from file
+        file_conf.seek(0);
+        file_conf.read(buf + EEPROM_BACKUP_HEADER_SIZE + EEPROM_SIZE, EEPROM_SIZE);
+
+        // Calculate checksum
+        uint16_t sum = 0;
+        for (uint16_t i = 0; i < total; i++) sum += buf[i];
+        buf[total] = sum & 0xFF;
+        buf[total + 1] = (sum >> 8) & 0xFF;
+
+        // Erase page and write
+        flash_nrf5x_erase(EEPROM_BACKUP_ADDR);
+        flash_nrf5x_write(EEPROM_BACKUP_ADDR, buf, total + 2);
+        flash_nrf5x_flush();
+        Serial.println("[EEPROM] Backup written to raw flash");
+    }
 #endif
 #include <stddef.h>
 
@@ -1156,59 +1242,149 @@ void promisc_disable() {
 }
 
 #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+    // Returns true if the logical address falls in the config region
+    bool addr_is_conf(int mapped_addr) {
+        int logical = mapped_addr - eeprom_addr(0);
+        return (logical >= ADDR_CONF_SF && logical <= ADDR_CONF_DADR);
+    }
+
+    // Open or create a file with initial data, returns true on success
+    bool eeprom_open_or_create(File &f, const char* name, uint8_t* init_data) {
+        if (InternalFS.exists(name)) {
+            if (f.open(name, FILE_O_WRITE)) {
+                if (f.size() == EEPROM_SIZE) return true;
+                f.close();
+                InternalFS.remove(name);
+            }
+        }
+        if (!f.open(name, FILE_O_WRITE)) return false;
+        if (f.write(init_data, EEPROM_SIZE) < EEPROM_SIZE) {
+            f.close();
+            return false;
+        }
+        f.flush();
+        return true;
+    }
+
+    // Restore eeprom_conf from eeprom_defaults
+    bool eeprom_restore_conf_from_defaults() {
+        uint8_t buf[EEPROM_SIZE];
+        file_defaults.seek(0);
+        if (file_defaults.read(buf, EEPROM_SIZE) != EEPROM_SIZE) {
+            // Defaults unreadable, use empty
+            memset(buf, 0, EEPROM_SIZE);
+        }
+        if (InternalFS.exists(EEPROM_FILE_CONF)) {
+            file_conf.close();
+            InternalFS.remove(EEPROM_FILE_CONF);
+        }
+        return eeprom_open_or_create(file_conf, EEPROM_FILE_CONF, buf);
+    }
+
     bool eeprom_begin() {
         if (!InternalFS.begin()) {
-            // FileSystem couldn't be initialized so fail
-			return false;
-		}
+            // InternalFS.begin() already auto-formats on failure,
+            // so if we get here, flash hardware is truly broken
+            return false;
+        }
 
-		if (InternalFS.exists(EEPROM_FILE)) {
-			if (file.open(EEPROM_FILE, FILE_O_WRITE)) {
-                // Check if file size matches expected EEPROM_SIZE
-                if (file.size() == EEPROM_SIZE) {
-                    // File was successfully opened for writing
-                    return true;
-                }
-                // File size mismatch (firmware changed EEPROM_SIZE), recreate
-                file.close();
-                InternalFS.remove(EEPROM_FILE);
+        // Migration: legacy single "eeprom" file exists
+        if (InternalFS.exists(EEPROM_FILE_LEGACY)) {
+            File file_legacy(InternalFS);
+            if (!file_legacy.open(EEPROM_FILE_LEGACY, FILE_O_READ)) return false;
+
+            uint8_t buffer[EEPROM_SIZE];
+            memset(buffer, 0, EEPROM_SIZE);
+            file_legacy.read(buffer, EEPROM_SIZE);
+            file_legacy.close();
+
+            if (!eeprom_open_or_create(file_rom, EEPROM_FILE_ROM, buffer)) return false;
+            if (!eeprom_open_or_create(file_conf, EEPROM_FILE_CONF, buffer)) return false;
+            if (!eeprom_open_or_create(file_defaults, EEPROM_FILE_DEFAULTS, buffer)) return false;
+
+            // Only remove legacy after all three are safely written
+            InternalFS.remove(EEPROM_FILE_LEGACY);
+            Serial.println("[EEPROM] Migrated legacy file to split files");
+            return true;
+        }
+
+        // Check if files are missing (e.g. after LittleFS auto-format due to corruption)
+        bool rom_missing = !InternalFS.exists(EEPROM_FILE_ROM);
+        bool conf_missing = !InternalFS.exists(EEPROM_FILE_CONF);
+
+        if ((rom_missing || conf_missing) && eeprom_backup_valid()) {
+            // Files lost (likely due to LittleFS corruption + auto-format)
+            // Restore from raw flash backup
+            uint8_t rom_data[EEPROM_SIZE];
+            uint8_t conf_data[EEPROM_SIZE];
+
+            if (eeprom_read_backup(rom_data, conf_data)) {
+                Serial.println("[EEPROM] Restoring from raw flash backup");
+
+                if (!eeprom_open_or_create(file_rom, EEPROM_FILE_ROM, rom_data)) return false;
+                if (!eeprom_open_or_create(file_conf, EEPROM_FILE_CONF, conf_data)) return false;
+                if (!eeprom_open_or_create(file_defaults, EEPROM_FILE_DEFAULTS, conf_data)) return false;
+
+                Serial.println("[EEPROM] Recovery from backup complete");
+                return true;
             } else {
-                // File exists but couldn't be opened for writing so reformat filesystem
-                if (!InternalFS.format()) {
-                    // FileSystem format failed so fail
-                    return false;
-                }
+                Serial.println("[EEPROM] Backup read failed, starting fresh");
             }
-		}
+        }
 
-        // File doesn't exist at this point
-		if (!file.open(EEPROM_FILE, FILE_O_WRITE)) {
-            // New file couldn't be opeend for writing so reformat filesystem in case it wasn't done previously
-			if (!InternalFS.format()) {
-                // FileSystem format failed so fail
-				return false;
-			}
-			if (!file.open(EEPROM_FILE, FILE_O_WRITE)) {
-                // New file still couldn't be opeend for writing so fail
-				return false;
-			}
-		}
-		// New file was successfully opeend for writing so initialise with empty content
-		uint8_t empty_content[EEPROM_SIZE] = {0};
-		if (file.write(empty_content, EEPROM_SIZE) < EEPROM_SIZE) {
-            // Write of content failed so fail
-			return false;
-		}
-        file.flush();
-        // File is opened for writing and all is well
-		return true;
+        // Normal boot: open split files
+        uint8_t empty[EEPROM_SIZE] = {0};
+
+        // ROM file
+        if (InternalFS.exists(EEPROM_FILE_ROM)) {
+            if (!file_rom.open(EEPROM_FILE_ROM, FILE_O_WRITE)) return false;
+            if (file_rom.size() != EEPROM_SIZE) {
+                file_rom.close();
+                InternalFS.remove(EEPROM_FILE_ROM);
+                if (!eeprom_open_or_create(file_rom, EEPROM_FILE_ROM, empty)) return false;
+            }
+        } else {
+            if (!eeprom_open_or_create(file_rom, EEPROM_FILE_ROM, empty)) return false;
+        }
+
+        // Defaults file
+        if (InternalFS.exists(EEPROM_FILE_DEFAULTS)) {
+            if (!file_defaults.open(EEPROM_FILE_DEFAULTS, FILE_O_WRITE)) return false;
+            if (file_defaults.size() != EEPROM_SIZE) {
+                file_defaults.close();
+                InternalFS.remove(EEPROM_FILE_DEFAULTS);
+                if (!eeprom_open_or_create(file_defaults, EEPROM_FILE_DEFAULTS, empty)) return false;
+            }
+        } else {
+            if (!eeprom_open_or_create(file_defaults, EEPROM_FILE_DEFAULTS, empty)) return false;
+        }
+
+        // Config file - restore from defaults if missing or corrupt
+        if (InternalFS.exists(EEPROM_FILE_CONF)) {
+            if (!file_conf.open(EEPROM_FILE_CONF, FILE_O_WRITE)) {
+                return eeprom_restore_conf_from_defaults();
+            }
+            if (file_conf.size() != EEPROM_SIZE) {
+                Serial.println("[EEPROM] Config file corrupt, restoring from defaults");
+                return eeprom_restore_conf_from_defaults();
+            }
+        } else {
+            Serial.println("[EEPROM] Config file missing, restoring from defaults");
+            return eeprom_restore_conf_from_defaults();
+        }
+
+        return true;
     }
 
     uint8_t eeprom_read(uint32_t mapped_addr) {
-        uint8_t byte;
-        void* byte_ptr = &byte;
-        file.seek(mapped_addr);
-        file.read(byte_ptr, 1);
+        uint8_t byte = 0xFF;
+        if (addr_is_conf(mapped_addr)) {
+            file_conf.seek(mapped_addr);
+            file_conf.read(&byte, 1);
+        } else {
+            file_rom.seek(mapped_addr);
+            file_rom.read(&byte, 1);
+        }
         return byte;
     }
 #endif
@@ -1267,11 +1443,23 @@ void kiss_dump_eeprom() {
 }
 
 #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+void eeprom_flush_rom() {
+    file_rom.close();
+    file_rom.open(EEPROM_FILE_ROM, FILE_O_WRITE);
+    written_bytes_rom = 0;
+    eeprom_write_backup();
+}
+
+void eeprom_flush_conf() {
+    file_conf.close();
+    file_conf.open(EEPROM_FILE_CONF, FILE_O_WRITE);
+    written_bytes_conf = 0;
+    eeprom_write_backup();
+}
+
 void eeprom_flush() {
-    // sync file contents to flash
-    file.close();
-    file.open(EEPROM_FILE, FILE_O_WRITE);
-    written_bytes = 0;
+    eeprom_flush_rom();
+    eeprom_flush_conf();
 }
 #endif
 
@@ -1284,31 +1472,32 @@ void eeprom_update(int mapped_addr, uint8_t byte) {
 			EEPROM.commit();
 		}
     #elif !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
-        // todo: clean up this implementation, writing one byte and syncing
-        // each time is really slow, but this is also suboptimal
+        bool is_conf = addr_is_conf(mapped_addr);
+        File &target = is_conf ? file_conf : file_rom;
+        int &written = is_conf ? written_bytes_conf : written_bytes_rom;
+        const char* fname = is_conf ? EEPROM_FILE_CONF : EEPROM_FILE_ROM;
+
         uint8_t read_byte;
-        void* read_byte_ptr = &read_byte;
-        file.seek(mapped_addr);
-        file.read(read_byte_ptr, 1);
-        file.seek(mapped_addr);
+        target.seek(mapped_addr);
+        target.read(&read_byte, 1);
+        target.seek(mapped_addr);
         if (read_byte != byte) {
-            file.write(byte);
+            target.write(byte);
         }
-        written_bytes++;
+        written++;
 
-        if ((mapped_addr - eeprom_addr(0)) == ADDR_INFO_LOCK) {
-			// have to do a flush because we're only writing 1 byte and it syncs after 4
-			eeprom_flush();
+        int logical = mapped_addr - eeprom_addr(0);
+        if (logical == ADDR_INFO_LOCK) {
+            eeprom_flush_rom();
         }
-        else if ((mapped_addr - eeprom_addr(0)) == ADDR_CONF_OK) {
-			// have to do a flush because we're only writing 1 byte and it syncs after 4
-			eeprom_flush();
+        else if (logical == ADDR_CONF_OK) {
+            eeprom_flush_conf();
         }
 
-        if (written_bytes >= 4) {
-            file.close();
-            file.open(EEPROM_FILE, FILE_O_WRITE);
-            written_bytes = 0;
+        if (written >= 4) {
+            target.close();
+            target.open(fname, FILE_O_WRITE);
+            written = 0;
         }
 	#endif
 }
@@ -1325,6 +1514,14 @@ void eeprom_erase() {
 	for (int addr = 0; addr < EEPROM_RESERVED; addr++) {
 		eeprom_update(eeprom_addr(addr), 0xFF);
 	}
+	#if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+		eeprom_flush();
+		// Also clear defaults
+		file_defaults.close();
+		InternalFS.remove(EEPROM_FILE_DEFAULTS);
+		uint8_t empty[EEPROM_SIZE] = {0};
+		eeprom_open_or_create(file_defaults, EEPROM_FILE_DEFAULTS, empty);
+	#endif
 	#ifdef HAS_RNS
 		reticulum.clear_caches();
 	#endif
@@ -1459,24 +1656,28 @@ void bt_conf_save(bool is_enabled) {
 	if (is_enabled) {
 		eeprom_update(eeprom_addr(ADDR_CONF_BT), BT_ENABLE_BYTE);
         #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
-            // have to do a flush because we're only writing 1 byte and it syncs after 8
-            eeprom_flush();
+            eeprom_flush_conf();
         #endif
 	} else {
 		eeprom_update(eeprom_addr(ADDR_CONF_BT), 0x00);
         #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
-            // have to do a flush because we're only writing 1 byte and it syncs after 8
-            eeprom_flush();
+            eeprom_flush_conf();
         #endif
 	}
 }
 
 void di_conf_save(uint8_t dint) {
 	eeprom_update(eeprom_addr(ADDR_CONF_DINT), dint);
+	#if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+		eeprom_flush_conf();
+	#endif
 }
 
 void da_conf_save(uint8_t dadr) {
 	eeprom_update(eeprom_addr(ADDR_CONF_DADR), dadr);
+	#if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+		eeprom_flush_conf();
+	#endif
 }
 
 bool eeprom_have_conf() {
@@ -1526,6 +1727,19 @@ void eeprom_conf_save() {
 		eeprom_update(eeprom_addr(ADDR_CONF_FREQ)+0x03, lora_freq);
 
 		eeprom_update(eeprom_addr(ADDR_CONF_OK), CONF_OK_BYTE);
+
+		#if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+			eeprom_flush_conf();
+			// Snapshot config as defaults (for power-loss recovery)
+			uint8_t conf_buf[EEPROM_SIZE];
+			file_conf.seek(0);
+			file_conf.read(conf_buf, EEPROM_SIZE);
+			file_defaults.seek(0);
+			file_defaults.write(conf_buf, EEPROM_SIZE);
+			file_defaults.close();
+			file_defaults.open(EEPROM_FILE_DEFAULTS, FILE_O_WRITE);
+		#endif
+
 		led_indicate_info(10);
 	} else {
 		led_indicate_warning(10);

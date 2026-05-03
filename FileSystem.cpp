@@ -108,6 +108,19 @@ bool FileSystem::init() {
 			return false;
 		}
 		INFO("InternalFS filesystem is ready");
+		// Guard against corrupted LittleFS — a corrupt filesystem can trigger
+		// a fatal assertion in lfs.c during file writes (e.g., after reflashing
+		// with a different firmware). Format preemptively if root dir is invalid.
+		{
+			File root = InternalFS.open("/");
+			if (!root || !root.isDirectory()) {
+				HEAD("Filesystem corrupt, formatting...", RNS::LOG_CRITICAL);
+				InternalFS.format();
+				InternalFS.begin();
+			} else {
+				root.close();
+			}
+		}
 #elif FS_TYPE == FS_TYPE_FLASHFS
 		// Initialize FlashFileSystem
 		INFO("FlashFS mounting filesystem");
@@ -487,7 +500,7 @@ void FileSystem::dumpDir(const char* dir) {
 	return true;
 }
 
-/*virtua*/ std::list<std::string> FileSystem::list_directory(const char* directory_path) {
+/*virtua*/ std::list<std::string> FileSystem::list_directory(const char* directory_path, Callbacks::DirectoryListing callback /*= nullptr*/) {
 	TRACEF("list_directory: listing directory %s", directory_path);
 	std::list<std::string> files;
 	File root = FS.open(directory_path);

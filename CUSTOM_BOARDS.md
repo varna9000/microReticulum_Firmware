@@ -84,52 +84,23 @@ uv run pio run -e xiao_nrf52840_lowpower
 
 When using duty cycle modes, transmitting nodes should use longer preambles (18+ symbols for balanced, 32+ for low power) to ensure reliable reception.
 
-### GPIO Control (XIAO nRF52840)
+### LXMF Remote Management (XIAO nRF52840)
 
-The XIAO nRF52840 + Wio-SX1262 kit has very few free GPIO pins because most are consumed by the radio module. Only three digital pins are available for GPIO control:
+The XIAO nRF52840 firmware includes an LXMF endpoint for remote node management. The node announces itself on boot and can be messaged from Sideband or MeshChat. Available commands:
 
-| Pin | Arduino Name | nRF52840 GPIO | Direction |
-|-----|-------------|---------------|-----------|
-| D0  | 0           | P0.02         | I/O       |
-| D6  | 6           | P1.11         | I/O       |
-| D7  | 7           | P1.12         | I/O       |
+| Command | Example | Description |
+|---------|---------|-------------|
+| `BATTERY` or `BAT` | `BATTERY` | Report battery voltage, percent, and charging state |
+| `ANNOUNCE [min]` or `ANN [min]` | `ANNOUNCE 30` | Show or set announce interval (1–1440 min) |
+| `HELP` | `HELP` | Show command list |
 
-**Pins D1–D5, D8–D10 are used by the SX1262 radio and must not be reassigned.**
+Every LXMF reply includes **Sideband Telemeter-format battery telemetry** (SID 0x04), so Sideband will natively display battery percentage and charging state in its telemetry UI.
 
-**Step 1 — Edit the pin table.** Open `GPIO_Control.h` and replace the default `gpio_pins[]` array with:
+**Battery monitoring:** The firmware reads battery voltage via the onboard ADC and detects charging state using the BQ25101 charger IC's `/CHG` pin (P0.17) combined with the nRF52840 USB power register. Three states are reported: discharging, charging, and charged.
 
-```cpp
-static GPIOPin gpio_pins[] = {
-    { 0, true, false, INPUT, "D0" },
-    { 6, true, false, INPUT, "D6" },
-    { 7, true, false, INPUT, "D7" },
-};
-```
+The `xiao_nrf52840` environment has LXMF management enabled by default (`-DHAS_GPIO_CONTROL` in `platformio.ini`). The node name is `RTransport-XXXX` where XXXX is a random 4-digit number generated at compile time.
 
-**Step 2 — Add the build flag.** In `platformio.ini`, add `-DHAS_GPIO_CONTROL` to the `xiao_nrf52840` environment's `build_flags`:
-
-```ini
-[env:xiao_nrf52840]
-build_flags =
-	${env.build_flags}
-	-fexceptions
-	-DBOARD_MODEL=BOARD_XIAO_NRF52840
-	-DHAS_GPIO_CONTROL
-	-DRNS_USE_ALLOCATOR=1
-	-DRNS_USE_TLSF=1
-	-Wl,--allow-multiple-definition
-```
-
-**Step 3 — Build and flash.**
-
-```bash
-rm -rf .pio/build
-uv run pio run -e xiao_nrf52840 --target upload
-```
-
-After boot, the LXMF address will appear in the serial output. Send commands from Sideband using **opportunistic** delivery.
-
-> **Note:** With only 3 GPIO pins, the XIAO is best suited for simple sensor inputs or relay triggers. For projects needing more I/O, use the TTGO LoRa32 v1 or Heltec WSL V1.
+After boot, the LXMF address appears in the serial output. Send commands from Sideband or MeshChat using **opportunistic** delivery.
 
 ---
 
@@ -339,21 +310,27 @@ After boot, the LXMF address will appear in the serial output. Send commands fro
 
 ---
 
-## GPIO Control — General Information
+## LXMF Remote Control — General Information
 
-GPIO control lets you set and read hardware pins on the RNode via LXMF messages sent from [Sideband](https://github.com/markqvist/Sideband). It works over any Reticulum transport — LoRa, serial, TCP, or mesh.
+The firmware runs a minimal LXMF endpoint alongside the RNode TNC, allowing remote management via [Sideband](https://github.com/markqvist/Sideband) or MeshChat. When a message arrives, it parses the text command, performs the operation, and sends a reply. The node announces its LXMF address on boot, so apps can discover it automatically.
 
-### How It Works
-
-The firmware runs a minimal LXMF endpoint alongside the RNode TNC. When a message arrives, `GPIO_Control.h` parses the text command, performs the GPIO operation, and sends a reply with the result. The node announces its LXMF address on boot, so Sideband can discover it automatically.
+Every reply includes Sideband Telemeter-format battery telemetry, so Sideband natively displays battery data in its telemetry UI.
 
 ### Delivery Mode
 
 Always use **opportunistic** delivery in Sideband. Direct delivery requires a full Reticulum Link handshake which is too resource-intensive for microcontrollers over LoRa.
 
-### Commands
+### Commands (XIAO nRF52840)
 
-All commands are case-insensitive.
+| Command | Example | Description |
+|---------|---------|-------------|
+| `BATTERY` | `BATTERY` | Battery voltage, percent, and charging state |
+| `ANNOUNCE [min]` | `ANNOUNCE 30` | Show or set announce interval |
+| `HELP` | `HELP` | Show command list |
+
+### Commands (ESP32 boards — TTGO, Heltec)
+
+ESP32 boards additionally support GPIO pin control:
 
 | Command | Example | Description |
 |---------|---------|-------------|
@@ -362,6 +339,8 @@ All commands are case-insensitive.
 | `MODE <pin> IN\|OUT` | `MODE 12 OUT` | Set pin direction |
 | `PINS` | `PINS` | List all available GPIO pins |
 | `STATUS` | `STATUS` | Report states of all configured pins |
+| `BATTERY` | `BATTERY` | Battery voltage, percent, and charging state |
+| `ANNOUNCE [min]` | `ANNOUNCE 30` | Show or set announce interval |
 | `HELP` | `HELP` | Show command list |
 
 ### Required Files
@@ -417,9 +396,10 @@ All Python scripts should be run via `uv run` to use the managed dependencies. I
 | `RNode_Firmware.ino` | Event-driven loop with sleep support, heap diagnostics |
 | `platformio.ini` | Added `xiao_nrf52840`, `xiao_nrf52840_lowpower`, `heltec_wsl_v1`, and `ttgo-lora32-v1` build environments |
 | `pyproject.toml` | Python dependencies for `uv sync` |
-| `FileSystem.cpp` | Fixed double-free, cache directory, `create=true`, filename truncation |
-| `GPIO_Control.h` | New — LXMF-based GPIO control |
-| `LXMF_Minimal.h` | New — lightweight LXMF message handling |
+| `FileSystem.cpp` | Fixed double-free, cache directory, `create=true`, filename truncation, nRF52840 FS corruption guard |
+| `GPIO_Control.h` | New — LXMF-based remote control (battery, announce, GPIO on ESP32) |
+| `LXMF_Minimal.h` | New — lightweight LXMF message handling with Sideband Telemeter telemetry |
+| `Power.h` | Fixed XIAO nRF52840 battery voltage divider and BQ25101 charging detection |
 
 ---
 

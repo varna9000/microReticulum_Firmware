@@ -44,6 +44,16 @@
   int bat_charged_samples = 0;
   bool bat_voltage_dropping = false;
   float bat_delay_v = 0;
+#elif BOARD_MODEL == BOARD_XIAO_NRF52840
+  #define BAT_V_MIN       3.15
+  #define BAT_V_MAX       4.2
+  #define BAT_V_FLOAT     4.1
+  #define BAT_SAMPLES     5
+  float bat_v_samples[BAT_SAMPLES];
+  float bat_p_samples[BAT_SAMPLES];
+  uint8_t bat_samples_count = 0;
+  bool bat_voltage_dropping = false;
+  float bat_delay_v = 0;
 #endif
 
 uint32_t last_pmu_update = 0;
@@ -112,6 +122,65 @@ void measure_battery() {
       //     SerialBT.print(" Voltage is not dropping.\n");
       //   }
       // }
+    }
+
+  #elif BOARD_MODEL == BOARD_XIAO_NRF52840
+    battery_installed = true;
+    battery_indeterminate = false;
+
+    // Configure charge status pin (BQ25101 /CHG on P0.17 = Arduino pin 23)
+    pinMode(23, INPUT);
+
+    // Enable VBAT reading, read ADC, then disable to save power
+    pinMode(VBAT_ENABLE, OUTPUT);
+    digitalWrite(VBAT_ENABLE, LOW);
+    delay(1);
+    // nRF52840 ADC: 12-bit (0-4095), internal ref 3.0V, battery divider calibrated to 2.957
+    bat_v_samples[bat_samples_count%BAT_SAMPLES] = (float)(analogRead(PIN_VBAT)) * 3.0 / 4095.0 * 2.957;
+    bat_p_samples[bat_samples_count%BAT_SAMPLES] = ((bat_v_samples[bat_samples_count%BAT_SAMPLES]-BAT_V_MIN) / (BAT_V_MAX-BAT_V_MIN))*100.0;
+    digitalWrite(VBAT_ENABLE, HIGH);
+
+    bat_samples_count++;
+    if (!battery_ready && bat_samples_count >= BAT_SAMPLES) {
+      battery_ready = true;
+    }
+
+    if (battery_ready) {
+      battery_voltage = 0;
+      battery_percent = 0;
+      for (uint8_t bi = 0; bi < BAT_SAMPLES; bi++) {
+        battery_voltage += bat_v_samples[bi];
+        battery_percent += bat_p_samples[bi];
+      }
+      battery_voltage = battery_voltage/BAT_SAMPLES;
+      battery_percent = battery_percent/BAT_SAMPLES;
+
+      if (bat_delay_v == 0) bat_delay_v = battery_voltage;
+      if (battery_percent > 100.0) battery_percent = 100.0;
+      if (battery_percent < 0.0) battery_percent = 0.0;
+
+      if (bat_samples_count%BAT_SAMPLES == 0) {
+        if (battery_voltage < bat_delay_v && battery_voltage < BAT_V_FLOAT) {
+          bat_voltage_dropping = true;
+        } else {
+          bat_voltage_dropping = false;
+        }
+        bat_delay_v = battery_voltage;
+        bat_samples_count = 0;
+      }
+
+      // Hardware charging detection via BQ25101 /CHG pin + USB power register
+      bool usb_present = (NRF_POWER->USBREGSTATUS & 0x01);  // VBUS detected
+      bool chg_active  = (digitalRead(23) == LOW);            // BQ25101 /CHG pin: LOW = charging
+
+      if (!usb_present) {
+        battery_state = BATTERY_STATE_DISCHARGING;
+      } else if (chg_active) {
+        battery_state = BATTERY_STATE_CHARGING;
+      } else {
+        battery_state = BATTERY_STATE_CHARGED;
+      }
+      external_power = usb_present;
     }
 
   #elif BOARD_MODEL == BOARD_TBEAM
@@ -213,6 +282,14 @@ void update_pmu() {
 bool init_pmu() {
   #if BOARD_MODEL == BOARD_RNODE_NG_21 || BOARD_MODEL == BOARD_LORA32_V2_1
     pinMode(pin_vbat, INPUT);
+    return true;
+  #elif BOARD_MODEL == BOARD_XIAO_NRF52840
+    // VBAT_ENABLE: LOW to enable reading, HIGH to disable (save power)
+    pinMode(VBAT_ENABLE, OUTPUT);
+    digitalWrite(VBAT_ENABLE, HIGH);
+    // Configure ADC for battery reading
+    analogReference(AR_INTERNAL_3_0);
+    analogReadResolution(12);
     return true;
   #elif BOARD_MODEL == BOARD_TBEAM
     Wire.begin(I2C_SDA, I2C_SCL);

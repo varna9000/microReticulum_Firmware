@@ -241,8 +241,107 @@ namespace RawMsgPack {
         return 9;
     }
 
+    // Pack a bool: true (0xC3) or false (0xC2)
+    inline size_t pack_bool(uint8_t* buf, size_t buflen, bool val) {
+        if (buflen < 1) return 0;
+        buf[0] = val ? 0xC3 : 0xC2;
+        return 1;
+    }
+
+    // Pack nil (0xC0)
+    inline size_t pack_nil(uint8_t* buf, size_t buflen) {
+        if (buflen < 1) return 0;
+        buf[0] = 0xC0;
+        return 1;
+    }
+
+    // Pack a positive fixint (0-127), used for msgpack integer keys like SIDs
+    inline size_t pack_fixint(uint8_t* buf, size_t buflen, uint8_t val) {
+        if (buflen < 1 || val > 127) return 0;
+        buf[0] = val;
+        return 1;
+    }
+
+    // Pack a float32 (big-endian)
+    inline size_t pack_float32(uint8_t* buf, size_t buflen, float val) {
+        if (buflen < 5) return 0;
+        buf[0] = 0xCA;  // float32
+        uint32_t bits;
+        memcpy(&bits, &val, 4);
+        buf[1] = (bits >> 24) & 0xFF;
+        buf[2] = (bits >> 16) & 0xFF;
+        buf[3] = (bits >> 8) & 0xFF;
+        buf[4] = bits & 0xFF;
+        return 5;
+    }
+
+    // Pack a uint32 (big-endian)
+    inline size_t pack_uint32(uint8_t* buf, size_t buflen, uint32_t val) {
+        if (buflen < 5) return 0;
+        buf[0] = 0xCE;  // uint32
+        buf[1] = (val >> 24) & 0xFF;
+        buf[2] = (val >> 16) & 0xFF;
+        buf[3] = (val >> 8) & 0xFF;
+        buf[4] = val & 0xFF;
+        return 5;
+    }
+
 } // namespace RawMsgPack
 
+
+// ============================================================================
+// Sideband Telemeter battery payload builder
+// Builds: msgpack({ 0x01: timestamp_uint32, 0x04: [percent, charging, null] })
+// ============================================================================
+
+// Forward declarations for battery globals (defined in Config.h)
+extern float    battery_voltage;
+extern float    battery_percent;
+extern uint8_t  battery_state;
+extern bool     battery_ready;
+
+#ifndef BATTERY_STATE_CHARGING
+#define BATTERY_STATE_CHARGING 0x02  // match Config.h
+#endif
+
+static size_t pack_battery_telemeter(uint8_t* buf, size_t buflen, uint32_t timestamp) {
+    if (buflen < 20) return 0;
+    size_t pos = 0;
+    size_t n;
+
+    // fixmap(2): two entries (SID_TIME + SID_BATTERY)
+    buf[pos++] = 0x82;
+
+    // Key: SID_TIME (0x01)
+    n = RawMsgPack::pack_fixint(&buf[pos], buflen - pos, 0x01);
+    if (n == 0) return 0; pos += n;
+
+    // Value: uint32 timestamp
+    n = RawMsgPack::pack_uint32(&buf[pos], buflen - pos, timestamp);
+    if (n == 0) return 0; pos += n;
+
+    // Key: SID_BATTERY (0x04)
+    n = RawMsgPack::pack_fixint(&buf[pos], buflen - pos, 0x04);
+    if (n == 0) return 0; pos += n;
+
+    // Value: fixarray(3) [charge_percent, charging_bool, null]
+    buf[pos++] = 0x93;  // fixarray(3)
+
+    // charge_percent as float32, rounded to 1 decimal
+    float pct = roundf(battery_percent * 10.0f) / 10.0f;
+    n = RawMsgPack::pack_float32(&buf[pos], buflen - pos, pct);
+    if (n == 0) return 0; pos += n;
+
+    // charging: true if battery_state == CHARGING
+    n = RawMsgPack::pack_bool(&buf[pos], buflen - pos, battery_state == BATTERY_STATE_CHARGING);
+    if (n == 0) return 0; pos += n;
+
+    // temperature: null
+    n = RawMsgPack::pack_nil(&buf[pos], buflen - pos);
+    if (n == 0) return 0; pos += n;
+
+    return pos;
+}
 
 // ============================================================================
 // LXMFMinimal class
@@ -384,8 +483,13 @@ public:
         }
     }
 
+    // ---- Set announce interval ----
+    void set_announce_interval(unsigned long ms) { _announce_interval = ms; }
+    unsigned long get_announce_interval() const { return _announce_interval; }
+
     // ---- Send reply ----
-    void send_reply(const uint8_t* dest_hash, const std::string& content) {
+    void send_reply(const uint8_t* dest_hash, const std::string& content,
+                    const uint8_t* telemetry_data = nullptr, size_t telemetry_len = 0) {
         if (!_initialized) return;
 
         // Look up the sender's identity from cache
@@ -431,8 +535,22 @@ public:
         if (content_len == 0) { Serial.println("[LXMF] Reply: content pack failed"); return; }
         pos += content_len;
 
-        // fields: nil
-        msgpack_buf[pos++] = 0xC0;
+        // fields: nil or {0x02: bin(telemetry_data)}
+        if (telemetry_data && telemetry_len > 0) {
+            // fixmap(1)
+            msgpack_buf[pos++] = 0x81;
+            // key: FIELD_TELEMETRY (0x02)
+            size_t k = RawMsgPack::pack_fixint(&msgpack_buf[pos], sizeof(msgpack_buf) - pos, 0x02);
+            if (k == 0) { Serial.println("[LXMF] Reply: telemetry key pack failed"); return; }
+            pos += k;
+            // value: bin(telemetry payload)
+            size_t v = RawMsgPack::pack_bin(&msgpack_buf[pos], sizeof(msgpack_buf) - pos,
+                                             telemetry_data, telemetry_len);
+            if (v == 0) { Serial.println("[LXMF] Reply: telemetry data pack failed"); return; }
+            pos += v;
+        } else {
+            msgpack_buf[pos++] = 0xC0;  // nil
+        }
 
         // ---- Step 2: Compute signature ----
         // Reference (LXMessage.py pack()):
@@ -475,12 +593,12 @@ public:
         // Opportunistic format: source_hash(16) + signature(64) + packed_payload
         // (destination_hash is implied by the RNS packet destination)
         size_t total_len = LXMF_HASH_LEN + LXMF_SIG_LEN + pos;
-        if (total_len > 400) {
+        if (total_len > 450) {
             Serial.println("[LXMF] Reply: payload too large");
             return;
         }
 
-        uint8_t lxmf_data[400];
+        uint8_t lxmf_data[450];
         size_t lxmf_pos = 0;
 
         // Our source hash
@@ -578,7 +696,18 @@ private:
         if (_handler) {
             std::string reply = _handler(source_hash, content);
             if (!reply.empty()) {
-                send_reply(source_hash, reply);
+                // Attach battery telemetry if available
+                uint8_t telem_buf[32];
+                size_t telem_len = 0;
+                if (battery_ready) {
+                    telem_len = pack_battery_telemeter(telem_buf, sizeof(telem_buf),
+                                                       (uint32_t)get_timestamp());
+                    if (telem_len == 0) {
+                        Serial.println("[LXMF] Reply: telemetry pack failed");
+                    }
+                }
+                send_reply(source_hash, reply,
+                           telem_len > 0 ? telem_buf : nullptr, telem_len);
             }
         }
     }

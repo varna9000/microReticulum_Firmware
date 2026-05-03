@@ -47,6 +47,8 @@ void hard_reset(void);
 
 #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
   void eeprom_flush();
+  void eeprom_flush_rom();
+  void eeprom_flush_conf();
 #endif
 
 const uint8_t dev_keys [] PROGMEM = {
@@ -107,6 +109,9 @@ void device_save_signature() {
     for (uint8_t i = 0; i < DEV_SIG_LEN; i++) {
       eeprom_update(dev_sig_addr(i), dev_sig[i]);
     }
+    #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+      eeprom_flush_rom();
+    #endif
   }
 }
 
@@ -135,7 +140,7 @@ void device_save_firmware_hash() {
     eeprom_update(dev_fwhash_addr(i), dev_firmware_hash_target[i]);
   }
   #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
-    eeprom_flush();
+    eeprom_flush_rom();
   #endif
   if (!fw_signature_validated) hard_reset();
 }
