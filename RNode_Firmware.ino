@@ -163,6 +163,13 @@ void on_log(const char* msg, RNS::LogLevel level) {
 
 // CBA receive packet callback
 void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
+  if (cable_state != CABLE_STATE_CONNECTED) {
+    Serial.print("[RX ] ");
+    Serial.print(raw.size());
+    Serial.print("B via ");
+    Serial.println(interface.name().c_str());
+    Serial.flush();
+  }
 #ifdef HAS_SDCARD
   TRACE("Logging receive packet to SD");
   String line = RNS::getTimeString() + String(" recv: ") + String(raw.toHex().c_str()) + "\n";
@@ -185,6 +192,13 @@ void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
 
 // CBA transmit packet callback
 void on_transmit_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
+  if (cable_state != CABLE_STATE_CONNECTED) {
+    Serial.print("[TX ] ");
+    Serial.print(raw.size());
+    Serial.print("B via ");
+    Serial.println(interface.name().c_str());
+    Serial.flush();
+  }
 #ifdef HAS_SDCARD
   TRACE("Logging transmit packet to SD");
   String line = RNS::getTimeString() + String(" send: ") + String(raw.toHex().c_str()) + "\n";
@@ -209,6 +223,71 @@ void on_transmit_packet(const RNS::Bytes& raw, const RNS::Interface& interface) 
 RNS::Reticulum reticulum(RNS::Type::NONE);
 RNS::Interface lora_interface(RNS::Type::NONE);
 RNS::FileSystem filesystem(RNS::Type::NONE);
+
+// Transport node periodic announce destinations
+RNS::Destination probe_destination(RNS::Type::NONE);
+RNS::Destination telemetry_destination(RNS::Type::NONE);
+unsigned long last_transport_announce = 0;
+unsigned long transport_announce_interval = 3600000;  // 1 hour default
+
+// Compile-time random node ID (changes every build via __TIME__)
+#define COMPILE_SEED ((__TIME__[0]-'0')*36000 + (__TIME__[1]-'0')*3600 + (__TIME__[3]-'0')*600 + (__TIME__[4]-'0')*60 + (__TIME__[6]-'0')*10 + (__TIME__[7]-'0'))
+#define NODE_ID ((COMPILE_SEED * 1103515245 + 12345) % 9000 + 1000)
+
+void announce_telemetry() {
+    if (!telemetry_destination) return;
+
+    // Pack battery data as msgpack fixmap(3): {"v": voltage, "p": percent, "s": state}
+    uint8_t buf[64];
+    size_t pos = 0;
+
+    buf[pos++] = 0x83;  // fixmap(3)
+
+    // "v" -> battery_voltage (float32)
+    buf[pos++] = 0xA1;  // fixstr(1)
+    buf[pos++] = 'v';
+    buf[pos++] = 0xCA;  // float32
+    float v = battery_voltage;
+    uint32_t vbits;
+    memcpy(&vbits, &v, 4);
+    buf[pos++] = (vbits >> 24) & 0xFF;
+    buf[pos++] = (vbits >> 16) & 0xFF;
+    buf[pos++] = (vbits >> 8) & 0xFF;
+    buf[pos++] = vbits & 0xFF;
+
+    // "p" -> battery_percent (float32)
+    buf[pos++] = 0xA1;  // fixstr(1)
+    buf[pos++] = 'p';
+    buf[pos++] = 0xCA;  // float32
+    float p = battery_percent;
+    uint32_t pbits;
+    memcpy(&pbits, &p, 4);
+    buf[pos++] = (pbits >> 24) & 0xFF;
+    buf[pos++] = (pbits >> 16) & 0xFF;
+    buf[pos++] = (pbits >> 8) & 0xFF;
+    buf[pos++] = pbits & 0xFF;
+
+    // "s" -> battery_state (uint8)
+    buf[pos++] = 0xA1;  // fixstr(1)
+    buf[pos++] = 's';
+    buf[pos++] = battery_state;  // msgpack positive fixint (0-127)
+
+    RNS::Bytes app_data(buf, pos);
+    telemetry_destination.announce(app_data);
+    Serial.println("[Telemetry] Announced with battery data");
+}
+
+void transport_announce_loop() {
+    if (!probe_destination || !telemetry_destination) return;
+
+    unsigned long now = millis();
+    if (now - last_transport_announce >= transport_announce_interval) {
+        probe_destination.announce();
+        Serial.println("[Transport] Probe re-announced");
+        announce_telemetry();
+        last_transport_announce = now;
+    }
+}
 #endif  // HAS_RNS
 
 void setup() {
@@ -471,7 +550,9 @@ void setup() {
 
 #ifdef HAS_RNS
   try {
+#ifdef ESP32
     Serial.printf("[HEAP] Before filesystem init: %u bytes free\r\n", ESP.getFreeHeap());
+#endif
     // CBA Init filesystem
 #if defined(RNS_USE_FS)
     filesystem = new FileSystem();
@@ -483,7 +564,9 @@ void setup() {
 
     HEAD("Registering filesystem...", RNS::LOG_TRACE);
     RNS::Utilities::OS::register_filesystem(filesystem);
+#ifdef ESP32
     Serial.printf("[HEAP] After filesystem init: %u bytes free\r\n", ESP.getFreeHeap());
+#endif
 
 #ifndef NDEBUG
     //filesystem.remove_directory("/cache");
@@ -519,58 +602,54 @@ void setup() {
 
     // CBA Start RNS
     if (hw_ready) {
-      RNS::setLogCallback(&on_log);
+      RNS::set_log_callback(&on_log);
       RNS::Transport::set_receive_packet_callback(on_receive_packet);
       RNS::Transport::set_transmit_packet_callback(on_transmit_packet);
 
-      Serial.write("Starting RNS...\r\n");
-      Serial.printf("[HEAP] Before RNS init: %u bytes free\r\n", ESP.getFreeHeap());
-      RNS::loglevel(RNS::LOG_WARNING);
+      Serial.println("[RNS] Starting RNS..."); Serial.flush();
+      RNS::loglevel(RNS::LOG_VERBOSE);
       //RNS::loglevel(RNS::LOG_MEM);
 
-      HEAD("Registering LoRA Interface...", RNS::LOG_TRACE);
+      Serial.println("[RNS] Registering LoRa interface..."); Serial.flush();
       lora_interface = new LoRaInterface();
       lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
       RNS::Transport::register_interface(lora_interface);
-      Serial.printf("[HEAP] After LoRa interface: %u bytes free\r\n", ESP.getFreeHeap());
 
-      HEAD("Creating Reticulum instance...", RNS::LOG_TRACE);
-      Serial.printf("[HEAP] Before Reticulum(): %u bytes free\r\n", ESP.getFreeHeap());
+      Serial.println("[RNS] Creating Reticulum instance..."); Serial.flush();
       reticulum = RNS::Reticulum();
-      Serial.printf("[HEAP] After Reticulum(): %u bytes free\r\n", ESP.getFreeHeap());
       reticulum.transport_enabled(op_mode == MODE_TNC);
-      reticulum.probe_destination_enabled(true);
-      Serial.printf("[HEAP] Before start(): %u bytes free\r\n", ESP.getFreeHeap());
-      reticulum.start();
-      Serial.printf("[HEAP] After start(): %u bytes free\r\n", ESP.getFreeHeap());
+      // We manage probe destination ourselves for periodic re-announcing
+      reticulum.probe_destination_enabled(false);
 
-      // CBA load/create local destination for admin node
-/*
-      RNS::Identity identity = {RNS::Type::NONE};
-      std::string local_identity_path = RNS::Reticulum::_storagepath + "/local_identity";
-      if (RNS::Utilities::OS::file_exists(local_identity_path.c_str())) {
-        identity = RNS::Identity::from_file(local_identity_path.c_str());
-      }
-      if (!identity) {
-        RNS::verbose("No valid local identity in storage, creating...");
-        identity = RNS::Identity();
-        identity.to_file(local_identity_path.c_str());
-      }
-      else {
-        RNS::verbose("Loaded local identity from storage");
-      }
-      RNS::Destination destination(identity, RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "local");
-*/
+      Serial.println("[RNS] Starting Reticulum..."); Serial.flush();
+      reticulum.start();
+      Serial.println("[RNS] Reticulum started"); Serial.flush();
+
       RNS::Destination destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "local");
 
-      HEAD("RNS is READY!", RNS::LOG_TRACE);
+      // Create probe destination (replaces library's built-in one)
+      probe_destination = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "probe");
+      probe_destination.accepts_links(false);
+      probe_destination.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
+      probe_destination.announce();
+      Serial.print("[RNS] Probe destination: "); Serial.println(probe_destination.hash().toHex().c_str());
+
+      // Create telemetry destination
+      telemetry_destination = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "telemetry");
+      telemetry_destination.accepts_links(false);
+      announce_telemetry();
+      Serial.print("[RNS] Telemetry destination: "); Serial.println(telemetry_destination.hash().toHex().c_str());
+
+      last_transport_announce = millis();
+
+      Serial.println("[RNS] RNS is READY!"); Serial.flush();
 
       // GPIO Control: Initialize LXMF endpoint for GPIO commands
       #ifdef HAS_GPIO_CONTROL
       {
           // Load or create persistent identity for LXMF GPIO endpoint
           RNS::Identity gpio_identity = {RNS::Type::NONE};
-          std::string gpio_id_path = std::string(RNS::Reticulum::_storagepath) + "/gpio_identity";
+          std::string gpio_id_path = "/gpio_identity";
           if (RNS::Utilities::OS::file_exists(gpio_id_path.c_str())) {
               gpio_identity = RNS::Identity::from_file(gpio_id_path.c_str());
               Serial.println("[GPIO] Loaded identity from storage");
@@ -581,7 +660,7 @@ void setup() {
               gpio_identity.to_file(gpio_id_path.c_str());
               Serial.println("[GPIO] New identity saved");
           }
-          gpio_control.init(gpio_identity, "GPIO Node");
+          gpio_control.init(gpio_identity, (std::string("RTransport-") + std::to_string(NODE_ID)).c_str());
       }
       #endif
       if (op_mode == MODE_TNC) {
@@ -814,9 +893,9 @@ bool startRadio() {
         // Initialize low power mode (after radio is configured)
         #if defined(HAS_LOWPOWER) && HAS_LOWPOWER == true
           lowpower_init();
-          // Set balanced mode by default for transport nodes
+          // Set normal mode by default for transport nodes (continuous RX required)
           if (op_mode == MODE_TNC) {
-            lowpower_set_mode(POWER_MODE_BALANCED);
+            lowpower_set_mode(POWER_MODE_PERFORMANCE);
           }
         #endif
 
@@ -1045,12 +1124,12 @@ void serialCallback(uint8_t sbyte) {
     IN_FRAME = true;
     command = CMD_UNKNOWN;
     frame_len = 0;
+    if (bt_state != BT_STATE_CONNECTED) cable_state = CABLE_STATE_CONNECTED;
   } else if (IN_FRAME && frame_len < MTU) {
     // Have a look at the command byte first
     if (frame_len == 0 && command == CMD_UNKNOWN) {
         command = sbyte;
     } else if (command == CMD_DATA) {
-        if (bt_state != BT_STATE_CONNECTED) cable_state = CABLE_STATE_CONNECTED;
         if (sbyte == FESC) {
             ESCAPE = true;
         } else {
@@ -1653,6 +1732,7 @@ void loop() {
   // CBA
   if (reticulum) {
 	  reticulum.loop();
+	  transport_announce_loop();
   }
 #endif
 
