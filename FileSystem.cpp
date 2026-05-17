@@ -11,7 +11,7 @@
 // limit is 62 chars due to off-by-one in the length check.
 // microReticulum uses 64-char SHA256 hex hashes as cache filenames.
 // Truncate to 32 chars (128 bits) — still astronomically collision-proof.
-#define FS_NAME_MAX 32  // ESP32 LittleFS has effective name limit well below CONFIG_LITTLEFS_OBJ_NAME_LEN=64
+#define FS_NAME_MAX 64  // SHA256 hex hash length used for cache filenames
 static std::string truncate_filename(const char* file_path) {
 	std::string path(file_path);
 	size_t last_slash = path.rfind('/');
@@ -100,6 +100,40 @@ bool FileSystem::init() {
 			return false;
 		}
 		DEBUG("LittleFS filesystem is ready");
+		// Check if the superblock has a restrictive name_max (e.g. 32 from
+		// mklittlefs). The LittleFS superblock stores name_max at format time,
+		// and the runtime downgrades to match it even if LFS_NAME_MAX=255.
+		// Test with a 64-char filename; if it fails, reformat to get name_max=255.
+		{
+			const char* test_path = "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+			File tf = LittleFS.open(test_path, FILE_WRITE, true);
+			if (tf) {
+				tf.close();
+				LittleFS.remove(test_path);
+			} else {
+				HEAD("LittleFS superblock has restrictive name_max, reformatting...", RNS::LOG_WARNING);
+				// Save identity files before reformat
+				RNS::Bytes transport_id, lxmf_id;
+				read_file("/transport_identity", transport_id);
+				read_file("/lxmf_identity", lxmf_id);
+				LittleFS.end();
+				LittleFS.format();
+				if (!LittleFS.begin(false, "/littlefs")) {
+					ERROR("LittleFS re-mount failed after reformat");
+					return false;
+				}
+				// Restore identity files
+				if (transport_id.size() > 0) {
+					write_file_direct("/transport_identity", transport_id);
+					INFO("Restored transport identity after reformat");
+				}
+				if (lxmf_id.size() > 0) {
+					write_file_direct("/lxmf_identity", lxmf_id);
+					INFO("Restored LXMF identity after reformat");
+				}
+				INFO("LittleFS reformatted with name_max=255");
+			}
+		}
 #elif FS_TYPE == FS_TYPE_INTERNALFS
 		// Initialize InternalFileSystem
 		INFO("InternalFS mounting filesystem");
