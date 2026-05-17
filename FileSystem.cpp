@@ -11,7 +11,7 @@
 // limit is 62 chars due to off-by-one in the length check.
 // microReticulum uses 64-char SHA256 hex hashes as cache filenames.
 // Truncate to 32 chars (128 bits) — still astronomically collision-proof.
-#define FS_NAME_MAX 32
+#define FS_NAME_MAX 32  // ESP32 LittleFS has effective name limit well below CONFIG_LITTLEFS_OBJ_NAME_LEN=64
 static std::string truncate_filename(const char* file_path) {
 	std::string path(file_path);
 	size_t last_slash = path.rfind('/');
@@ -111,12 +111,18 @@ bool FileSystem::init() {
 		// Guard against corrupted LittleFS — a corrupt filesystem can trigger
 		// a fatal assertion in lfs.c during file writes (e.g., after reflashing
 		// with a different firmware). Format preemptively if root dir is invalid.
+		// Note: we format rather than reformat here because reading files from
+		// a corrupt FS is unreliable. Identity files are restored from raw flash
+		// backup in RNode_Firmware.ino after filesystem init completes.
 		{
 			File root = InternalFS.open("/");
 			if (!root || !root.isDirectory()) {
 				HEAD("Filesystem corrupt, formatting...", RNS::LOG_CRITICAL);
 				InternalFS.format();
-				InternalFS.begin();
+				if (!InternalFS.begin()) {
+					ERROR("InternalFS re-mount failed after format");
+					return false;
+				}
 			} else {
 				root.close();
 			}
@@ -144,12 +150,21 @@ bool FileSystem::init() {
 			remove_file("/test");
 		}
 
-		// Ensure required directories exist
-		// microReticulum stores identity/path caches in /cache/
-		const char* required_dirs[] = { "/cache" };
-		for (const char* dir : required_dirs) {
-			if (!directory_exists(dir)) {
-				create_directory(dir);
+		// Ensure /cache directory exists
+		FS.mkdir("/cache");
+
+		// Prune cache if filesystem is getting full
+		prune_cache();
+
+		// Recover interrupted atomic writes for identity files
+		const char* identity_files[] = { "/transport_identity", "/lxmf_identity" };
+		for (const char* path : identity_files) {
+			std::string tmp = std::string(path) + ".tmp";
+			if (file_exists(tmp.c_str()) && !file_exists(path)) {
+				rename_file(tmp.c_str(), path);
+				WARNINGF("Recovered interrupted write: %s", path);
+			} else if (file_exists(tmp.c_str())) {
+				remove_file(tmp.c_str());
 			}
 		}
 	}
@@ -183,8 +198,8 @@ bool FileSystem::reformat() {
 		read_file("/eeprom", eeprom);
 		RNS::Bytes transport_identity;
 		read_file("/transport_identity", transport_identity);
-		//RNS::Bytes time_offset;
-		//read_file("/time_offset", time_offset);
+		RNS::Bytes lxmf_identity;
+		read_file("/lxmf_identity", lxmf_identity);
 		if (!FS.format()) {
 			ERROR("Format failed!");
 			return false;
@@ -195,9 +210,9 @@ bool FileSystem::reformat() {
 		if (transport_identity) {
 			write_file("/transport_identity", transport_identity);
 		}
-		//if (time_offset) {
-		//	write_file("/time_offset", time_offset);
-		//}
+		if (lxmf_identity) {
+			write_file("/lxmf_identity", lxmf_identity);
+		}
 		return true;
 	}
 	catch (std::exception& e) {
@@ -347,11 +362,54 @@ void FileSystem::dumpDir(const char* dir) {
     return read;
 }
 
-/*virtua*/ size_t FileSystem::write_file(const char* file_path, const RNS::Bytes& data) {
-	std::string safe_path = truncate_filename(file_path);
-	file_path = safe_path.c_str();
-	TRACEF("write_file: writing to file %s", file_path);
-	// CBA TODO Replace remove with working truncation
+// Atomic write: write to .tmp then rename. Power-safe for critical files.
+size_t FileSystem::write_file_atomic(const char* file_path, const RNS::Bytes& data) {
+	std::string tmp_path = std::string(file_path) + ".tmp";
+	TRACEF("write_file_atomic: writing to %s via %s", file_path, tmp_path.c_str());
+
+	// Write to temp file first
+	if (FS.exists(tmp_path.c_str())) {
+		FS.remove(tmp_path.c_str());
+	}
+	size_t wrote = 0;
+#if FS_TYPE == FS_TYPE_INTERNALFS || FS_TYPE == FS_TYPE_FLASHFS
+	File file(FS);
+	if (file.open(tmp_path.c_str(), FILE_O_WRITE)) {
+#else
+	File file = FS.open(tmp_path.c_str(), FILE_WRITE, true);
+	if (file) {
+#endif
+		wrote = file.write(data.data(), data.size());
+		file.close();
+	}
+	if (wrote < data.size()) {
+		WARNINGF("write_file_atomic: temp write failed for %s", file_path);
+		FS.remove(tmp_path.c_str());
+		return 0;
+	}
+
+	// Rename temp to target (if power lost here, .tmp recovery handles it on boot)
+	if (FS.exists(file_path)) {
+		FS.remove(file_path);
+	}
+#if FS_TYPE == FS_TYPE_INTERNALFS || FS_TYPE == FS_TYPE_FLASHFS
+	// InternalFS uses LittleFS rename
+	if (InternalFS.rename(tmp_path.c_str(), file_path)) {
+#else
+	if (FS.rename(tmp_path.c_str(), file_path)) {
+#endif
+		TRACEF("write_file_atomic: %s updated (%u bytes)", file_path, wrote);
+	} else {
+		WARNINGF("write_file_atomic: rename failed, falling back to direct write for %s", file_path);
+		FS.remove(tmp_path.c_str());
+		return write_file_direct(file_path, data);
+	}
+	return wrote;
+}
+
+// Direct (non-atomic) write — the original implementation
+size_t FileSystem::write_file_direct(const char* file_path, const RNS::Bytes& data) {
+	TRACEF("write_file_direct: writing to file %s", file_path);
 	if (FS.exists(file_path)) {
 		FS.remove(file_path);
 	}
@@ -363,21 +421,34 @@ void FileSystem::dumpDir(const char* dir) {
 	File file = FS.open(file_path, FILE_WRITE, true);
 	if (file) {
 #endif
-		// Seek to beginning to overwrite
-		//file.seek(0);
-		//file.truncate(0);
 		wrote = file.write(data.data(), data.size());
-        TRACEF("write_file: wrote %u bytes to file %s", wrote, file_path);
+        TRACEF("write_file_direct: wrote %u bytes to file %s", wrote, file_path);
         if (wrote < data.size()) {
-			WARNINGF("write_file: not all data was written to file %s", file_path);
+			WARNINGF("write_file_direct: not all data was written to file %s", file_path);
 		}
-		//TRACE("write_file: closing output file");
 		file.close();
 	}
 	else {
-		ERRORF("write_file: failed to open output file %s", file_path);
+		ERRORF("write_file_direct: failed to open output file %s", file_path);
 	}
     return wrote;
+}
+
+/*virtua*/ size_t FileSystem::write_file(const char* file_path, const RNS::Bytes& data) {
+	std::string safe_path = truncate_filename(file_path);
+	file_path = safe_path.c_str();
+
+	// Use atomic write for identity files (power-safe)
+	if (safe_path.find("_identity") != std::string::npos) {
+		return write_file_atomic(file_path, data);
+	}
+
+	// Prune cache if filesystem is getting full before cache writes
+	if (safe_path.find("/cache/") != std::string::npos) {
+		prune_cache();
+	}
+
+    return write_file_direct(file_path, data);
 }
 
 /*virtual*/ RNS::FileStream FileSystem::open_file(const char* file_path, RNS::FileStream::MODE file_mode) {
@@ -537,6 +608,26 @@ void FileSystem::dumpDir(const char* dir) {
 #else
 	return (FS.totalBytes() - FS.usedBytes());
 #endif
+}
+
+void FileSystem::prune_cache() {
+	size_t total = storage_size();
+	if (total == 0) return;
+	size_t threshold = total / 7; // ~15% free
+	size_t available = storage_available();
+	if (available >= threshold) return;
+
+	std::list<std::string> files = list_directory("/cache");
+	size_t removed = 0;
+	for (auto& name : files) {
+		if (storage_available() >= threshold) break;
+		std::string path = "/cache/" + name;
+		remove_file(path.c_str());
+		removed++;
+	}
+	if (removed > 0) {
+		WARNINGF("Pruned %zu cache files, %zu bytes free", removed, storage_available());
+	}
 }
 
 #endif

@@ -179,12 +179,14 @@ fi
 ok "Bootloader drive found: $UF2_DRIVE"
 info "Copying UF2 firmware (board will reboot automatically)..."
 
-# Copy UF2 — exit code 1 is expected because the board reboots mid-copy
-cat "$BUILD_DIR/${FW_NAME}.uf2" > "$UF2_DRIVE/fw.uf2" 2>/dev/null || true
+# Copy UF2 to bootloader drive
+cp "$BUILD_DIR/${FW_NAME}.uf2" "$UF2_DRIVE/" 2>/dev/null || true
+# Ensure macOS flushes the write to the USB device before the board processes it
+sync 2>/dev/null || true
 
 # Wait for board to reboot with new firmware
 info "Waiting for board to reboot..."
-sleep 3
+sleep 5
 
 # ═════════════════════════════════════════════════════════
 # STEP 4: Wait for serial port

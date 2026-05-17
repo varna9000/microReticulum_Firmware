@@ -17,6 +17,9 @@ public:
 	bool init();
 	bool format();
 	bool reformat();
+	size_t write_file_atomic(const char* file_path, const RNS::Bytes& data);
+	size_t write_file_direct(const char* file_path, const RNS::Bytes& data);
+	void prune_cache();
 
 	// CBA Debug
 	static void listDir(const char* dir, const char* prefix = "");

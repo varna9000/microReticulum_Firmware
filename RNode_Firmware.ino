@@ -146,11 +146,20 @@ void on_log(const char* msg, RNS::LogLevel level) {
   // Only write RNS logs to Serial when no KISS client is connected.
   // KISS protocol and ASCII log text share the same UART — interleaving
   // them corrupts KISS framing and prevents rnodeconf from communicating.
+#ifdef DEBUG_TRANSPORT
+  // Debug mode: always log to serial regardless of cable state
+  {
+    String line = RNS::getTimeString() + String(" [") + RNS::getLevelName(level) + "] " + msg + "\n";
+    Serial.print(line);
+    Serial.flush();
+  }
+#else
   if (cable_state != CABLE_STATE_CONNECTED) {
     String line = RNS::getTimeString() + String(" [") + RNS::getLevelName(level) + "] " + msg + "\n";
     Serial.print(line);
     Serial.flush();
   }
+#endif
 
 #ifdef HAS_SDCARD
 	File file = SD.open("/logfile.txt", FILE_APPEND);
@@ -163,6 +172,13 @@ void on_log(const char* msg, RNS::LogLevel level) {
 
 // CBA receive packet callback
 void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
+#ifdef DEBUG_TRANSPORT
+  Serial.print("[RX ] ");
+  Serial.print(raw.size());
+  Serial.print("B via ");
+  Serial.println(interface.name().c_str());
+  Serial.flush();
+#else
   if (cable_state != CABLE_STATE_CONNECTED) {
     Serial.print("[RX ] ");
     Serial.print(raw.size());
@@ -170,6 +186,7 @@ void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
     Serial.println(interface.name().c_str());
     Serial.flush();
   }
+#endif
 #ifdef HAS_SDCARD
   TRACE("Logging receive packet to SD");
   String line = RNS::getTimeString() + String(" recv: ") + String(raw.toHex().c_str()) + "\n";
@@ -192,6 +209,13 @@ void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
 
 // CBA transmit packet callback
 void on_transmit_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
+#ifdef DEBUG_TRANSPORT
+  Serial.print("[TX ] ");
+  Serial.print(raw.size());
+  Serial.print("B via ");
+  Serial.println(interface.name().c_str());
+  Serial.flush();
+#else
   if (cable_state != CABLE_STATE_CONNECTED) {
     Serial.print("[TX ] ");
     Serial.print(raw.size());
@@ -199,6 +223,7 @@ void on_transmit_packet(const RNS::Bytes& raw, const RNS::Interface& interface) 
     Serial.println(interface.name().c_str());
     Serial.flush();
   }
+#endif
 #ifdef HAS_SDCARD
   TRACE("Logging transmit packet to SD");
   String line = RNS::getTimeString() + String(" send: ") + String(raw.toHex().c_str()) + "\n";
@@ -232,7 +257,7 @@ unsigned long transport_announce_interval = 3600000;  // 1 hour default
 
 // Compile-time random node ID (changes every build via __TIME__)
 #define COMPILE_SEED ((__TIME__[0]-'0')*36000 + (__TIME__[1]-'0')*3600 + (__TIME__[3]-'0')*600 + (__TIME__[4]-'0')*60 + (__TIME__[6]-'0')*10 + (__TIME__[7]-'0'))
-#define NODE_ID ((COMPILE_SEED * 1103515245 + 12345) % 9000 + 1000)
+#define NODE_ID (((unsigned long)COMPILE_SEED * 1103515245UL + 12345UL) % 9000UL + 1000UL)
 
 void announce_telemetry() {
     if (!telemetry_destination) return;
@@ -564,6 +589,38 @@ void setup() {
 
     HEAD("Registering filesystem...", RNS::LOG_TRACE);
     RNS::Utilities::OS::register_filesystem(filesystem);
+
+    // Restore identity files from raw flash backup if missing (e.g. after LittleFS auto-format)
+    // This MUST happen before reticulum.start() so Transport::start() finds the file
+    #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+    {
+        uint8_t transport_buf[IDENTITY_KEY_SIZE];
+        uint8_t lxmf_buf[IDENTITY_KEY_SIZE];
+        uint8_t restored = 0;
+
+        if (!RNS::Utilities::OS::file_exists("/transport_identity") ||
+            !RNS::Utilities::OS::file_exists("/lxmf_identity")) {
+            uint8_t valid = identity_read_backup(transport_buf, lxmf_buf);
+
+            if (!RNS::Utilities::OS::file_exists("/transport_identity") && (valid & 0x01)) {
+                RNS::Bytes transport_data(transport_buf, IDENTITY_KEY_SIZE);
+                RNS::Utilities::OS::write_file("/transport_identity", transport_data);
+                Serial.println("[IDENTITY] Restored transport identity from raw flash backup");
+                restored |= 0x01;
+            }
+            if (!RNS::Utilities::OS::file_exists("/lxmf_identity") && (valid & 0x02)) {
+                RNS::Bytes lxmf_data(lxmf_buf, IDENTITY_KEY_SIZE);
+                RNS::Utilities::OS::write_file("/lxmf_identity", lxmf_data);
+                Serial.println("[IDENTITY] Restored LXMF identity from raw flash backup");
+                restored |= 0x02;
+            }
+
+            if (!restored && !(valid & 0x03)) {
+                Serial.println("[IDENTITY] WARNING: No identity backup available, new identities will be generated");
+            }
+        }
+    }
+    #endif
 #ifdef ESP32
     Serial.printf("[HEAP] After filesystem init: %u bytes free\r\n", ESP.getFreeHeap());
 #endif
@@ -607,7 +664,11 @@ void setup() {
       RNS::Transport::set_transmit_packet_callback(on_transmit_packet);
 
       Serial.println("[RNS] Starting RNS..."); Serial.flush();
+#ifdef DEBUG_TRANSPORT
+      RNS::loglevel(RNS::LOG_TRACE);
+#else
       RNS::loglevel(RNS::LOG_VERBOSE);
+#endif
       //RNS::loglevel(RNS::LOG_MEM);
 
       Serial.println("[RNS] Registering LoRa interface..."); Serial.flush();
@@ -644,25 +705,72 @@ void setup() {
 
       Serial.println("[RNS] RNS is READY!"); Serial.flush();
 
-      // GPIO Control: Initialize LXMF endpoint for GPIO commands
+      // LXMF endpoint initialization
       #ifdef HAS_GPIO_CONTROL
       {
-          // Load or create persistent identity for LXMF GPIO endpoint
-          RNS::Identity gpio_identity = {RNS::Type::NONE};
-          std::string gpio_id_path = "/gpio_identity";
-          if (RNS::Utilities::OS::file_exists(gpio_id_path.c_str())) {
-              gpio_identity = RNS::Identity::from_file(gpio_id_path.c_str());
-              Serial.println("[GPIO] Loaded identity from storage");
+          // Migrate legacy gpio_identity → lxmf_identity
+          if (RNS::Utilities::OS::file_exists("/gpio_identity") &&
+              !RNS::Utilities::OS::file_exists("/lxmf_identity")) {
+              RNS::Utilities::OS::rename_file("/gpio_identity", "/lxmf_identity");
+              Serial.println("[LXMF] Migrated gpio_identity → lxmf_identity");
           }
-          if (!gpio_identity) {
-              Serial.println("[GPIO] Creating new identity...");
-              gpio_identity = RNS::Identity();
-              gpio_identity.to_file(gpio_id_path.c_str());
-              Serial.println("[GPIO] New identity saved");
+
+          // Load or create persistent identity for LXMF endpoint
+          RNS::Identity lxmf_identity = {RNS::Type::NONE};
+          std::string lxmf_id_path = "/lxmf_identity";
+          if (RNS::Utilities::OS::file_exists(lxmf_id_path.c_str())) {
+              lxmf_identity = RNS::Identity::from_file(lxmf_id_path.c_str());
+              Serial.println("[LXMF] Loaded identity from storage");
           }
-          gpio_control.init(gpio_identity, (std::string("RTransport-") + std::to_string(NODE_ID)).c_str());
+          if (!lxmf_identity) {
+              Serial.println("[LXMF] Creating new identity...");
+              lxmf_identity = RNS::Identity();
+              lxmf_identity.to_file(lxmf_id_path.c_str());
+              Serial.println("[LXMF] New identity saved");
+          }
+          gpio_control.init(lxmf_identity, (std::string("RTransport-") + std::to_string(NODE_ID)).c_str());
       }
       #endif
+
+      // Back up identity keys to raw flash (survives LittleFS corruption)
+      #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
+      {
+          RNS::Bytes transport_key;
+          RNS::Bytes lxmf_key;
+          RNS::Utilities::OS::read_file("/transport_identity", transport_key);
+          RNS::Utilities::OS::read_file("/lxmf_identity", lxmf_key);
+
+          // Check if backup needs updating
+          uint8_t existing_transport[IDENTITY_KEY_SIZE];
+          uint8_t existing_lxmf[IDENTITY_KEY_SIZE];
+          uint8_t existing_valid = identity_read_backup(existing_transport, existing_lxmf);
+
+          bool needs_update = false;
+          if (transport_key.size() == IDENTITY_KEY_SIZE) {
+              if (!(existing_valid & 0x01) || memcmp(transport_key.data(), existing_transport, IDENTITY_KEY_SIZE) != 0) {
+                  needs_update = true;
+              }
+          }
+          if (lxmf_key.size() == IDENTITY_KEY_SIZE) {
+              if (!(existing_valid & 0x02) || memcmp(lxmf_key.data(), existing_lxmf, IDENTITY_KEY_SIZE) != 0) {
+                  needs_update = true;
+              }
+          }
+
+          if (needs_update) {
+              write_full_backup(
+                  transport_key.size() == IDENTITY_KEY_SIZE ? transport_key.data() : NULL,
+                  transport_key.size(),
+                  lxmf_key.size() == IDENTITY_KEY_SIZE ? lxmf_key.data() : NULL,
+                  lxmf_key.size()
+              );
+              Serial.println("[IDENTITY] Backup updated in raw flash");
+          } else {
+              Serial.println("[IDENTITY] Backup is current");
+          }
+      }
+      #endif
+
       if (op_mode == MODE_TNC) {
         HEAD("RNS transport mode is ENABLED", RNS::LOG_TRACE);
         TRACE(std::string("Frequency: " + std::to_string(lora_freq)) + " Hz");
@@ -1733,6 +1841,13 @@ void loop() {
   if (reticulum) {
 	  reticulum.loop();
 	  transport_announce_loop();
+
+	  // Periodic cache pruning (every 5 minutes)
+	  static unsigned long last_cache_prune = 0;
+	  if (millis() - last_cache_prune >= 300000) {
+		  ((FileSystem*)filesystem.get())->prune_cache();
+		  last_cache_prune = millis();
+	  }
   }
 #endif
 
