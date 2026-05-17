@@ -47,7 +47,15 @@
     #define EEPROM_BACKUP_MAGIC_2 'B'
     #define EEPROM_BACKUP_MAGIC_3 'K'
     #define EEPROM_BACKUP_HEADER_SIZE 8
-    // Layout: [magic 4B][version 1B][reserved 3B][ROM EEPROM_SIZE B][CONF EEPROM_SIZE B][checksum 2B]
+    #define IDENTITY_KEY_SIZE 64
+    // v1 layout: [magic 4B][version 1B][reserved 3B][ROM][CONF][checksum 2B]
+    // v2 layout: [magic 4B][version 1B][flags 1B][reserved 2B][ROM][CONF]
+    //            [ID_MAGIC 2B "ID"][transport_len 1B][transport_id 64B]
+    //            [lxmf_len 1B][lxmf_id 64B][checksum 2B]
+    #define BACKUP_FLAG_HAS_IDENTITY 0x01
+    #define IDENTITY_SECTION_MAGIC_0 'I'
+    #define IDENTITY_SECTION_MAGIC_1 'D'
+    #define IDENTITY_SECTION_SIZE (2 + 1 + IDENTITY_KEY_SIZE + 1 + IDENTITY_KEY_SIZE) // 132 bytes
 
     bool eeprom_backup_valid() {
         const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
@@ -55,60 +63,135 @@
                 p[2] == EEPROM_BACKUP_MAGIC_2 && p[3] == EEPROM_BACKUP_MAGIC_3);
     }
 
-    bool eeprom_read_backup(uint8_t* rom_out, uint8_t* conf_out) {
-        const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
-
-        // Verify magic
-        if (!eeprom_backup_valid()) return false;
-
+    // Compute total backup size based on version/flags at the given raw flash pointer
+    static uint16_t backup_total_size(const uint8_t* p) {
         uint16_t total = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
+        if (p[4] >= 0x02 && (p[5] & BACKUP_FLAG_HAS_IDENTITY)) {
+            total += IDENTITY_SECTION_SIZE;
+        }
+        return total;
+    }
 
-        // Verify checksum
+    static bool backup_checksum_valid(const uint8_t* p) {
+        uint16_t total = backup_total_size(p);
         uint16_t sum = 0;
         for (uint16_t i = 0; i < total; i++) sum += p[i];
         uint16_t stored = p[total] | (p[total + 1] << 8);
-        if (sum != stored) {
+        return (sum == stored);
+    }
+
+    bool eeprom_read_backup(uint8_t* rom_out, uint8_t* conf_out) {
+        const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
+        if (!eeprom_backup_valid()) return false;
+        if (!backup_checksum_valid(p)) {
             Serial.println("[EEPROM] Backup checksum mismatch");
             return false;
         }
-
         memcpy(rom_out, p + EEPROM_BACKUP_HEADER_SIZE, EEPROM_SIZE);
         memcpy(conf_out, p + EEPROM_BACKUP_HEADER_SIZE + EEPROM_SIZE, EEPROM_SIZE);
         return true;
     }
 
-    void eeprom_write_backup() {
-        uint16_t total = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
-        uint8_t buf[total + 2]; // +2 for checksum
+    // Read identity keys from raw flash backup (v2+)
+    // Returns bitmask: bit 0 = transport valid, bit 1 = lxmf valid
+    uint8_t identity_read_backup(uint8_t* transport_out, uint8_t* lxmf_out) {
+        const uint8_t* p = (const uint8_t*)EEPROM_BACKUP_ADDR;
+        if (!eeprom_backup_valid()) return 0;
+        if (p[4] < 0x02 || !(p[5] & BACKUP_FLAG_HAS_IDENTITY)) return 0;
+        if (!backup_checksum_valid(p)) {
+            Serial.println("[IDENTITY] Backup checksum mismatch");
+            return 0;
+        }
 
-        // Header
+        uint16_t id_offset = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
+        if (p[id_offset] != IDENTITY_SECTION_MAGIC_0 || p[id_offset + 1] != IDENTITY_SECTION_MAGIC_1) {
+            Serial.println("[IDENTITY] Identity section magic mismatch");
+            return 0;
+        }
+
+        uint8_t result = 0;
+        uint8_t transport_len = p[id_offset + 2];
+        if (transport_len == IDENTITY_KEY_SIZE && transport_out) {
+            memcpy(transport_out, p + id_offset + 3, IDENTITY_KEY_SIZE);
+            result |= 0x01;
+        }
+        uint8_t lxmf_len = p[id_offset + 3 + IDENTITY_KEY_SIZE];
+        if (lxmf_len == IDENTITY_KEY_SIZE && lxmf_out) {
+            memcpy(lxmf_out, p + id_offset + 3 + IDENTITY_KEY_SIZE + 1, IDENTITY_KEY_SIZE);
+            result |= 0x02;
+        }
+        return result;
+    }
+
+    // Write full backup page: EEPROM data + identity keys (v2 format)
+    // If transport_id or lxmf_id is NULL, preserves existing identity from flash
+    void write_full_backup(const uint8_t* transport_id, uint8_t transport_len,
+                           const uint8_t* lxmf_id, uint8_t lxmf_len) {
+        uint16_t total = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE + IDENTITY_SECTION_SIZE;
+        uint8_t buf[total + 2]; // +2 for checksum
+        memset(buf, 0xFF, sizeof(buf));
+
+        // Header (v2)
         buf[0] = EEPROM_BACKUP_MAGIC_0;
         buf[1] = EEPROM_BACKUP_MAGIC_1;
         buf[2] = EEPROM_BACKUP_MAGIC_2;
         buf[3] = EEPROM_BACKUP_MAGIC_3;
-        buf[4] = 0x01; // version
-        buf[5] = 0x00; // reserved
+        buf[4] = 0x02; // version 2
+        buf[5] = BACKUP_FLAG_HAS_IDENTITY;
         buf[6] = 0x00;
         buf[7] = 0x00;
 
-        // Read current ROM data from file
+        // Read current ROM/CONF data from EEPROM files
         file_rom.seek(0);
         file_rom.read(buf + EEPROM_BACKUP_HEADER_SIZE, EEPROM_SIZE);
-
-        // Read current CONF data from file
         file_conf.seek(0);
         file_conf.read(buf + EEPROM_BACKUP_HEADER_SIZE + EEPROM_SIZE, EEPROM_SIZE);
 
-        // Calculate checksum
+        // Identity section
+        uint16_t id_offset = EEPROM_BACKUP_HEADER_SIZE + 2 * EEPROM_SIZE;
+        buf[id_offset] = IDENTITY_SECTION_MAGIC_0;
+        buf[id_offset + 1] = IDENTITY_SECTION_MAGIC_1;
+
+        // If caller didn't provide an identity, try to preserve from existing backup
+        uint8_t existing_transport[IDENTITY_KEY_SIZE];
+        uint8_t existing_lxmf[IDENTITY_KEY_SIZE];
+        uint8_t existing_valid = identity_read_backup(existing_transport, existing_lxmf);
+
+        if (transport_id && transport_len == IDENTITY_KEY_SIZE) {
+            buf[id_offset + 2] = IDENTITY_KEY_SIZE;
+            memcpy(buf + id_offset + 3, transport_id, IDENTITY_KEY_SIZE);
+        } else if (existing_valid & 0x01) {
+            buf[id_offset + 2] = IDENTITY_KEY_SIZE;
+            memcpy(buf + id_offset + 3, existing_transport, IDENTITY_KEY_SIZE);
+        } else {
+            buf[id_offset + 2] = 0; // no transport identity available
+        }
+
+        if (lxmf_id && lxmf_len == IDENTITY_KEY_SIZE) {
+            buf[id_offset + 3 + IDENTITY_KEY_SIZE] = IDENTITY_KEY_SIZE;
+            memcpy(buf + id_offset + 3 + IDENTITY_KEY_SIZE + 1, lxmf_id, IDENTITY_KEY_SIZE);
+        } else if (existing_valid & 0x02) {
+            buf[id_offset + 3 + IDENTITY_KEY_SIZE] = IDENTITY_KEY_SIZE;
+            memcpy(buf + id_offset + 3 + IDENTITY_KEY_SIZE + 1, existing_lxmf, IDENTITY_KEY_SIZE);
+        } else {
+            buf[id_offset + 3 + IDENTITY_KEY_SIZE] = 0; // no lxmf identity available
+        }
+
+        // Checksum over entire payload
         uint16_t sum = 0;
         for (uint16_t i = 0; i < total; i++) sum += buf[i];
         buf[total] = sum & 0xFF;
         buf[total + 1] = (sum >> 8) & 0xFF;
 
-        // Erase page and write
+        // Erase page and write atomically
         flash_nrf5x_erase(EEPROM_BACKUP_ADDR);
         flash_nrf5x_write(EEPROM_BACKUP_ADDR, buf, total + 2);
         flash_nrf5x_flush();
+    }
+
+    // Legacy wrapper: write EEPROM backup, preserving any existing identity data
+    void eeprom_write_backup() {
+        write_full_backup(NULL, 0, NULL, 0);
         Serial.println("[EEPROM] Backup written to raw flash");
     }
 #endif
@@ -154,12 +237,10 @@ uint8_t eeprom_read(uint32_t mapped_addr);
 	#include "Device.h"
 #endif
 #if MCU_VARIANT == MCU_ESP32
-  #if BOARD_MODEL == BOARD_HELTEC32_V3
+  #if defined(IS_ESP32S3)
     //https://github.com/espressif/esp-idf/issues/8855
     #include "hal/wdt_hal.h"
-	#elif BOARD_MODEL == BOARD_RNODE_NG_22
-		#include "hal/wdt_hal.h"
-  #else BOARD_MODEL != BOARD_RNODE_NG_22
+  #else
 	  #include "soc/rtc_wdt.h"
 	#endif
   #define ISR_VECT IRAM_ATTR
@@ -302,6 +383,11 @@ extern RNS::Reticulum reticulum;
 			void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
 			void led_tx_off() { digitalWrite(pin_led_tx, LOW); }
 	#elif BOARD_MODEL == BOARD_HWSL_V1
+			void led_rx_on()  { digitalWrite(pin_led_rx, HIGH); }
+			void led_rx_off() {	digitalWrite(pin_led_rx, LOW); }
+			void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
+			void led_tx_off() { digitalWrite(pin_led_tx, LOW); }
+	#elif BOARD_MODEL == BOARD_XIAO_ESP32S3
 			void led_rx_on()  { digitalWrite(pin_led_rx, HIGH); }
 			void led_rx_off() {	digitalWrite(pin_led_rx, LOW); }
 			void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
@@ -1550,7 +1636,7 @@ bool eeprom_product_valid() {
 	#if PLATFORM == PLATFORM_AVR
 	if (rval == PRODUCT_RNODE || rval == PRODUCT_HMBRW) {
 	#elif PLATFORM == PLATFORM_ESP32
-	if (rval == PRODUCT_RNODE || rval == BOARD_RNODE_NG_20 || rval == BOARD_RNODE_NG_21 || rval == PRODUCT_HMBRW || rval == PRODUCT_TBEAM || rval == PRODUCT_T32_10 || rval == PRODUCT_T32_20 || rval == PRODUCT_T32_21 || rval == PRODUCT_H32_V2 || rval == PRODUCT_H32_V3 || rval == PRODUCT_HWSL_V1) {
+	if (rval == PRODUCT_RNODE || rval == BOARD_RNODE_NG_20 || rval == BOARD_RNODE_NG_21 || rval == PRODUCT_HMBRW || rval == PRODUCT_TBEAM || rval == PRODUCT_T32_10 || rval == PRODUCT_T32_20 || rval == PRODUCT_T32_21 || rval == PRODUCT_H32_V2 || rval == PRODUCT_H32_V3 || rval == PRODUCT_HWSL_V1 || rval == PRODUCT_XIAO_ESP32S3) {
 	#elif PLATFORM == PLATFORM_NRF52
 	if (rval == PRODUCT_RAK4631 || rval == PRODUCT_XIAO_NRF52840 || rval == PRODUCT_HMBRW) {
 	#else
@@ -1596,6 +1682,8 @@ bool eeprom_model_valid() {
     if (model == MODEL_11 || model == MODEL_12) {
     #elif BOARD_MODEL == BOARD_XIAO_NRF52840
     if (model == MODEL_11 || model == MODEL_12) {
+	#elif BOARD_MODEL == BOARD_XIAO_ESP32S3
+    if (model == MODEL_13) {
 	#elif BOARD_MODEL == BOARD_HUZZAH32
 	if (model == MODEL_FF) {
 	#elif BOARD_MODEL == BOARD_GENERIC_ESP32

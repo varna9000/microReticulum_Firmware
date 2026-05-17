@@ -43,6 +43,7 @@
   #define BOARD_GENERIC_NRF52 0x50
   #define BOARD_RAK4631       0x51
   #define BOARD_XIAO_NRF52840 0x52
+  #define BOARD_XIAO_ESP32S3  0x53
   #define BOARD_HWSL_V1       0x43
 
   #if defined(__AVR_ATmega1284P__)
@@ -66,6 +67,8 @@
     #if BOARD_MODEL == BOARD_RAK4631
       #define MODEM SX1262
     #elif BOARD_MODEL == BOARD_XIAO_NRF52840
+      #define MODEM SX1262
+    #elif BOARD_MODEL == BOARD_XIAO_ESP32S3
       #define MODEM SX1262
     #elif BOARD_MODEL == BOARD_GENERIC_NRF52
       #define MODEM SX1262
@@ -293,6 +296,45 @@
       const int pin_mosi = 10;
       const int pin_miso = 11;
       const int pin_sclk = 9;
+
+    #elif BOARD_MODEL == BOARD_XIAO_ESP32S3
+      // Seeed XIAO ESP32-S3 + Wio-SX1262 Meshtastic Kit (B2B connector)
+      #define IS_ESP32S3 true
+      #undef HAS_DISPLAY
+      #define HAS_DISPLAY false
+      #undef HAS_BLUETOOTH
+      #define HAS_BLUETOOTH false
+      #undef HAS_BLE
+      #define HAS_BLE true
+      #define HAS_CONSOLE false
+      #undef HAS_EEPROM
+      #define HAS_EEPROM true
+      #undef HAS_PMU
+      #define HAS_PMU false
+      #undef HAS_NP
+      #define HAS_NP false
+      #define HAS_SD false
+
+      #define MODEM SX1262
+      #undef HAS_TCXO
+      #define HAS_TCXO true
+      #define HAS_RF_SWITCH_RX_TX true
+      #undef HAS_BUSY
+      #define HAS_BUSY true
+      #define DIO2_AS_RF_SWITCH true
+
+      // SX1262 pins via B2B connector
+      const int pin_rxen = 38;
+      const int pin_reset = 42;
+      const int pin_cs = 41;
+      const int pin_sclk = 7;
+      const int pin_mosi = 9;
+      const int pin_miso = 8;
+      const int pin_busy = 40;
+      const int pin_dio = 39;
+      const int pin_led_rx = 21;
+      const int pin_led_tx = 21;
+      const int pin_tcxo_enable = -1;
 
     #elif BOARD_MODEL == BOARD_HWSL_V1
       // Heltec Wireless Stick Lite V1 (ESP32-PICO-D4 + SX1276)

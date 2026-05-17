@@ -131,7 +131,7 @@ bool sx126x::preInit() {
   pinMode(_ss, OUTPUT);
   digitalWrite(_ss, HIGH);
   
-  #if BOARD_MODEL == BOARD_RNODE_NG_22 || BOARD_MODEL == BOARD_HELTEC32_V3
+  #if BOARD_MODEL == BOARD_RNODE_NG_22 || BOARD_MODEL == BOARD_HELTEC32_V3 || BOARD_MODEL == BOARD_XIAO_ESP32S3
     SPI.begin(pin_sclk, pin_miso, pin_mosi, pin_cs);
   #else
     SPI.begin();
@@ -805,6 +805,8 @@ void sx126x::enableTCXO() {
     #elif BOARD_MODEL == BOARD_RNODE_NG_22
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
     #elif BOARD_MODEL == BOARD_XIAO_NRF52840
+      uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
+    #elif BOARD_MODEL == BOARD_XIAO_ESP32S3
       uint8_t buf[4] = {MODE_TCXO_1_8V_6X, 0x00, 0x00, 0xFF};
     #endif
     executeOpcode(OP_DIO3_TCXO_CTRL_6X, buf, 4);

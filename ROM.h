@@ -29,8 +29,10 @@
 	#define PRODUCT_HWSL_V1 0xC5
     #define PRODUCT_RAK4631 0x10
     #define PRODUCT_XIAO_NRF52840 0x11
+    #define PRODUCT_XIAO_ESP32S3 0x12
     #define MODEL_11 0x11
     #define MODEL_12 0x12
+    #define MODEL_13 0x13
 	#define MODEL_A1 0xA1
 	#define MODEL_A6 0xA6
 	#define MODEL_A4 0xA4
