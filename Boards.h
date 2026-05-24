@@ -299,13 +299,14 @@
 
     #elif BOARD_MODEL == BOARD_XIAO_ESP32S3
       // Seeed XIAO ESP32-S3 + Wio-SX1262 Meshtastic Kit (B2B connector)
+      // Solar LoRa-only node: WiFi and BLE radios stay off; only SX1262 active.
       #define IS_ESP32S3 true
       #undef HAS_DISPLAY
       #define HAS_DISPLAY false
       #undef HAS_BLUETOOTH
       #define HAS_BLUETOOTH false
       #undef HAS_BLE
-      #define HAS_BLE true
+      #define HAS_BLE false
       #define HAS_CONSOLE false
       #undef HAS_EEPROM
       #define HAS_EEPROM true
@@ -495,11 +496,13 @@
       const int pin_tcxo_enable = -1;
 
     #elif BOARD_MODEL == BOARD_XIAO_NRF52840
+      // Transport-only node: LoRa is the only radio. BLE disabled to save
+      // flash, RAM, and avoid the Bluefruit advertising power overhead.
       #define HAS_EEPROM false
       #define HAS_DISPLAY false
       #define HAS_BLUETOOTH false
       #undef HAS_BLE
-      #define HAS_BLE true
+      #define HAS_BLE false
       #define HAS_CONSOLE false
       #define HAS_PMU true
       #define HAS_NP false

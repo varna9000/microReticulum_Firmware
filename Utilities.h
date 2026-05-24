@@ -243,6 +243,7 @@ uint8_t eeprom_read(uint32_t mapped_addr);
   #else
 	  #include "soc/rtc_wdt.h"
 	#endif
+  #include "soc/rtc_cntl_reg.h"
   #define ISR_VECT IRAM_ATTR
 #else
   #define ISR_VECT
@@ -388,10 +389,11 @@ extern RNS::Reticulum reticulum;
 			void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
 			void led_tx_off() { digitalWrite(pin_led_tx, LOW); }
 	#elif BOARD_MODEL == BOARD_XIAO_ESP32S3
-			void led_rx_on()  { digitalWrite(pin_led_rx, HIGH); }
-			void led_rx_off() {	digitalWrite(pin_led_rx, LOW); }
-			void led_tx_on()  { digitalWrite(pin_led_tx, HIGH); }
-			void led_tx_off() { digitalWrite(pin_led_tx, LOW); }
+			// XIAO ESP32-S3 user LED (GPIO 21) is active LOW
+			void led_rx_on()  { digitalWrite(pin_led_rx, LOW); }
+			void led_rx_off() {	digitalWrite(pin_led_rx, HIGH); }
+			void led_tx_on()  { digitalWrite(pin_led_tx, LOW); }
+			void led_tx_off() { digitalWrite(pin_led_tx, HIGH); }
 	#elif BOARD_MODEL == BOARD_LORA32_V2_1
 		void led_rx_on()  { digitalWrite(pin_led_rx, HIGH); }
 		void led_rx_off() {	digitalWrite(pin_led_rx, LOW); }
@@ -433,6 +435,21 @@ void hard_reset(void) {
 		ESP.restart();
 	#elif MCU_VARIANT == MCU_NRF52
         NVIC_SystemReset();
+	#endif
+}
+
+void enter_bootloader(void) {
+	#if MCU_VARIANT == MCU_ESP32
+		#if defined(CONFIG_IDF_TARGET_ESP32S3)
+			// Force next boot into ROM download mode regardless of GPIO0 strap.
+			// Needed for XIAO ESP32-S3 + Wio-SX1262 kit where the BOOT button
+			// is physically obstructed by the carrier board.
+			// RTC_CNTL_OPTION1_REG / FORCE_DOWNLOAD_BOOT exists only on S3.
+			REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+		#endif
+		esp_restart();
+	#else
+		hard_reset();
 	#endif
 }
 
@@ -1367,13 +1384,11 @@ void promisc_disable() {
         return eeprom_open_or_create(file_conf, EEPROM_FILE_CONF, buf);
     }
 
-    bool eeprom_begin() {
-        if (!InternalFS.begin()) {
-            // InternalFS.begin() already auto-formats on failure,
-            // so if we get here, flash hardware is truly broken
-            return false;
-        }
-
+    // Open all EEPROM-backed files. Returns false on any failure; caller is
+    // responsible for closing handles before retrying (see eeprom_begin).
+    // Extracted from eeprom_begin so the whole open path can be retried after
+    // an InternalFS.format() when the FS is corrupt past auto-recovery.
+    bool eeprom_open_files() {
         // Migration: legacy single "eeprom" file exists
         if (InternalFS.exists(EEPROM_FILE_LEGACY)) {
             File file_legacy(InternalFS);
@@ -1457,6 +1472,48 @@ void promisc_disable() {
         } else {
             Serial.println("[EEPROM] Config file missing, restoring from defaults");
             return eeprom_restore_conf_from_defaults();
+        }
+
+        return true;
+    }
+
+    bool eeprom_begin() {
+        // Mount, with format-and-retry if a brownout-corrupted superblock
+        // prevents mount entirely.
+        if (!InternalFS.begin()) {
+            Serial.println("[EEPROM] InternalFS mount failed, forcing format..."); Serial.flush();
+            InternalFS.format();
+            if (!InternalFS.begin()) {
+                Serial.println("[EEPROM] InternalFS unrecoverable after format"); Serial.flush();
+                return false;
+            }
+            Serial.println("[EEPROM] InternalFS recovered after format"); Serial.flush();
+        }
+
+        // Try the normal open path. If it fails — typically because LFS
+        // returned LFS_ERR_CORRUPT mid-traversal on a metadata block that's
+        // damaged below the superblock level — close any partial handles,
+        // format, and retry. Without this, the partially-open handles get
+        // touched by validate_status()/eeprom_read() and trip LFS again.
+        if (!eeprom_open_files()) {
+            Serial.println("[EEPROM] File operations failed (corrupt FS?), forcing format..."); Serial.flush();
+            file_rom.close();
+            file_conf.close();
+            file_defaults.close();
+            InternalFS.format();
+            if (!InternalFS.begin()) {
+                Serial.println("[EEPROM] Re-mount failed after format"); Serial.flush();
+                return false;
+            }
+            if (!eeprom_open_files()) {
+                // Make damn sure no half-open handles survive on the failure path.
+                file_rom.close();
+                file_conf.close();
+                file_defaults.close();
+                Serial.println("[EEPROM] File operations still failing after format"); Serial.flush();
+                return false;
+            }
+            Serial.println("[EEPROM] Recovered files after format"); Serial.flush();
         }
 
         return true;

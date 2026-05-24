@@ -17,6 +17,12 @@
 #include <vector>
 #include <algorithm>
 
+// Battery globals (defined in Config.h, populated by Power.h)
+extern bool    battery_ready;
+extern float   battery_voltage;
+extern float   battery_percent;
+extern uint8_t battery_state;
+
 // ─── Helpers ────────────────────────────────────────────────────
 
 static std::string str_upper(std::string s) {
@@ -61,6 +67,7 @@ static std::string handle_command(const std::string& raw_command) {
         return "Commands:\n"
                "BATTERY\n"
                "ANNOUNCE [min]\n"
+               "DUTY [ON [pct] | OFF]\n"
                "HELP";
     }
 
@@ -104,6 +111,45 @@ static std::string handle_command(const std::string& raw_command) {
         char buf[48];
         snprintf(buf, sizeof(buf), "OK Announce interval: %d min", minutes);
         return std::string(buf);
+    }
+
+    // ── DUTY (EU duty-cycle airtime limit) ──
+    if (verb == "DUTY" || verb == "DC") {
+        extern float st_airtime_limit;
+        extern float lt_airtime_limit;
+        extern bool  airtime_lock;
+
+        if (tokens.size() < 2) {
+            bool on = (lt_airtime_limit > 0.0f) || (st_airtime_limit > 0.0f);
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "Duty: %s  LT %.2f%%  ST %.2f%%%s",
+                     on ? "ON" : "OFF",
+                     lt_airtime_limit * 100.0f,
+                     st_airtime_limit * 100.0f,
+                     airtime_lock ? "  [LOCKED]" : "");
+            return std::string(buf);
+        }
+
+        const std::string& arg = tokens[1];
+        if (arg == "OFF" || arg == "0") {
+            st_airtime_limit = 0.0f;
+            lt_airtime_limit = 0.0f;
+            return "OK Duty: OFF (no airtime limit)";
+        }
+        if (arg == "ON" || arg == "1") {
+            float pct = 1.0f;  // EU 868 MHz regulatory default
+            if (tokens.size() >= 3) {
+                try { pct = std::stof(tokens[2]); }
+                catch (...) { return "ERR: Bad percentage: " + tokens[2]; }
+                if (pct <= 0.0f || pct >= 100.0f) return "ERR: Percent must be 0 < x < 100";
+            }
+            lt_airtime_limit = pct / 100.0f;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "OK Duty: ON  LT %.2f%%", pct);
+            return std::string(buf);
+        }
+        return "ERR: DUTY [ON [pct] | OFF]";
     }
 
     return "ERR: Unknown: " + verb + " (try HELP)";

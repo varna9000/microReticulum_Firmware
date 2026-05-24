@@ -50,6 +50,10 @@ SPIClass SDSPI(HSPI);
   #include <esp_task_wdt.h>
 #endif
 
+#if BOARD_MODEL == BOARD_XIAO_ESP32S3
+  #include "esp_bt.h"
+#endif
+
 // Low Power Management
 #include "LowPower.h"
 
@@ -83,7 +87,13 @@ volatile bool serial_buffering = false;
 char sbuf[128];
 
 #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
-  bool packet_ready = false;
+  volatile bool packet_ready = false;
+  // No-activity watchdog: if both TX and RX have been silent for too long,
+  // assume the modem is wedged and self-reset. Healthy node TXes its announce
+  // at least every 10 min, so 15 min is a safe upper bound.
+  volatile unsigned long last_rx_millis = 0;
+  volatile unsigned long last_tx_millis = 0;
+  #define NO_ACTIVITY_RESET_MS (15UL * 60UL * 1000UL)
 #endif
 
 #ifdef HAS_RNS
@@ -249,67 +259,22 @@ RNS::Reticulum reticulum(RNS::Type::NONE);
 RNS::Interface lora_interface(RNS::Type::NONE);
 RNS::FileSystem filesystem(RNS::Type::NONE);
 
-// Transport node periodic announce destinations
+// Transport node periodic announce destination
 RNS::Destination probe_destination(RNS::Type::NONE);
-RNS::Destination telemetry_destination(RNS::Type::NONE);
 unsigned long last_transport_announce = 0;
-unsigned long transport_announce_interval = 3600000;  // 1 hour default
+unsigned long transport_announce_interval = 600000;  // 10 minutes default
 
 // Compile-time random node ID (changes every build via __TIME__)
 #define COMPILE_SEED ((__TIME__[0]-'0')*36000 + (__TIME__[1]-'0')*3600 + (__TIME__[3]-'0')*600 + (__TIME__[4]-'0')*60 + (__TIME__[6]-'0')*10 + (__TIME__[7]-'0'))
 #define NODE_ID (((unsigned long)COMPILE_SEED * 1103515245UL + 12345UL) % 9000UL + 1000UL)
 
-void announce_telemetry() {
-    if (!telemetry_destination) return;
-
-    // Pack battery data as msgpack fixmap(3): {"v": voltage, "p": percent, "s": state}
-    uint8_t buf[64];
-    size_t pos = 0;
-
-    buf[pos++] = 0x83;  // fixmap(3)
-
-    // "v" -> battery_voltage (float32)
-    buf[pos++] = 0xA1;  // fixstr(1)
-    buf[pos++] = 'v';
-    buf[pos++] = 0xCA;  // float32
-    float v = battery_voltage;
-    uint32_t vbits;
-    memcpy(&vbits, &v, 4);
-    buf[pos++] = (vbits >> 24) & 0xFF;
-    buf[pos++] = (vbits >> 16) & 0xFF;
-    buf[pos++] = (vbits >> 8) & 0xFF;
-    buf[pos++] = vbits & 0xFF;
-
-    // "p" -> battery_percent (float32)
-    buf[pos++] = 0xA1;  // fixstr(1)
-    buf[pos++] = 'p';
-    buf[pos++] = 0xCA;  // float32
-    float p = battery_percent;
-    uint32_t pbits;
-    memcpy(&pbits, &p, 4);
-    buf[pos++] = (pbits >> 24) & 0xFF;
-    buf[pos++] = (pbits >> 16) & 0xFF;
-    buf[pos++] = (pbits >> 8) & 0xFF;
-    buf[pos++] = pbits & 0xFF;
-
-    // "s" -> battery_state (uint8)
-    buf[pos++] = 0xA1;  // fixstr(1)
-    buf[pos++] = 's';
-    buf[pos++] = battery_state;  // msgpack positive fixint (0-127)
-
-    RNS::Bytes app_data(buf, pos);
-    telemetry_destination.announce(app_data);
-    Serial.println("[Telemetry] Announced with battery data");
-}
-
 void transport_announce_loop() {
-    if (!probe_destination || !telemetry_destination) return;
+    if (!probe_destination) return;
 
     unsigned long now = millis();
     if (now - last_transport_announce >= transport_announce_interval) {
         probe_destination.announce();
         Serial.println("[Transport] Probe re-announced");
-        announce_telemetry();
         last_transport_announce = now;
     }
 }
@@ -325,6 +290,13 @@ void setup() {
     Serial.setRxBufferSize(CONFIG_UART_BUFFER_SIZE);
   #endif
   Serial.begin(serial_baudrate);
+
+  #if BOARD_MODEL == BOARD_XIAO_ESP32S3
+    // Solar LoRa-only node: BLE controller never starts (HAS_BLE=false).
+    // Return its reserved memory pool to the general heap. Safe because
+    // no code path in this build calls esp_bt_controller_init().
+    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+  #endif
 
   // CBA Safely wait for serial initialization
   while (!Serial) {
@@ -371,11 +343,14 @@ void setup() {
     Serial.print("RAK4631");
   #elif BOARD_MODEL == BOARD_XIAO_NRF52840
     Serial.print("XIAO_NRF52840");
+  #elif BOARD_MODEL == BOARD_XIAO_ESP32S3
+    Serial.print("XIAO_ESP32S3");
   #else
     Serial.print("UNKNOWN");
   #endif
   Serial.print(", Baud: ");
   Serial.println(serial_baudrate);
+  Serial.flush();
 
   // Configure WDT
   #if MCU_VARIANT == MCU_ESP32
@@ -397,6 +372,7 @@ void setup() {
   #if MCU_VARIANT == MCU_NRF52
     if (!eeprom_begin()) {
         Serial.write("EEPROM initialisation failed.\r\n");
+        Serial.flush();
     }
   #endif
 
@@ -430,6 +406,8 @@ void setup() {
   #if HAS_NP == false
     pinMode(pin_led_rx, OUTPUT);
     pinMode(pin_led_tx, OUTPUT);
+    led_rx_off();
+    led_tx_off();
   #endif
 
   #if HAS_TCXO == true
@@ -468,7 +446,7 @@ void setup() {
     // probe boot parameters.
     if (LoRa->preInit()) {
       modem_installed = true;
-      Serial.println("[RNode] Modem detected");
+      Serial.println("[RNode] Modem detected"); Serial.flush();
       uint32_t lfr = LoRa->getFrequency();
       if (lfr == 0) {
         // Normal boot
@@ -525,7 +503,7 @@ void setup() {
         kiss_indicate_reset();
       #endif
     } else {
-      Serial.println("[RNode] Entering TNC/KISS mode");
+      Serial.println("[RNode] Entering TNC/KISS mode"); Serial.flush();
       kiss_indicate_reset();
     }
   #endif
@@ -534,6 +512,7 @@ void setup() {
   validate_status();
   Serial.print("[RNode] Op mode: ");
   Serial.println(op_mode == MODE_TNC ? "TNC" : "Normal");
+  Serial.flush();
   if (op_mode == MODE_TNC) {
     Serial.print("[RNode] Freq: "); Serial.print(lora_freq); Serial.println(" Hz");
     Serial.print("[RNode] BW: "); Serial.print(lora_bw); Serial.println(" Hz");
@@ -579,21 +558,24 @@ void setup() {
     Serial.printf("[HEAP] Before filesystem init: %u bytes free\r\n", ESP.getFreeHeap());
 #endif
     // CBA Init filesystem
+    bool fs_ready = false;
 #if defined(RNS_USE_FS)
     filesystem = new FileSystem();
-    ((FileSystem*)filesystem.get())->init();
+    fs_ready = ((FileSystem*)filesystem.get())->init();
 #else
     filesystem = new NoopFileSystem();
-    ((FileSystem*)filesystem.get())->init();
+    fs_ready = ((FileSystem*)filesystem.get())->init();
 #endif
+    Serial.print("[RNS] Filesystem ready: "); Serial.println(fs_ready ? "yes" : "no"); Serial.flush();
 
     HEAD("Registering filesystem...", RNS::LOG_TRACE);
     RNS::Utilities::OS::register_filesystem(filesystem);
 
     // Restore identity files from raw flash backup if missing (e.g. after LittleFS auto-format)
-    // This MUST happen before reticulum.start() so Transport::start() finds the file
+    // This MUST happen before reticulum.start() so Transport::start() finds the file.
+    // Skip when the filesystem isn't mounted — writing into an unmounted LittleFS hard-faults.
     #if !HAS_EEPROM && MCU_VARIANT == MCU_NRF52
-    {
+    if (fs_ready) {
         uint8_t transport_buf[IDENTITY_KEY_SIZE];
         uint8_t lxmf_buf[IDENTITY_KEY_SIZE];
         uint8_t restored = 0;
@@ -651,14 +633,16 @@ void setup() {
       }
 */
     TRACE("FILE: destination_table");
-    RNS::Bytes content;
-    if (filesystem.read_file("/destination_table", content) > 0) {
-      TRACE(content.toString() + "\r\n");
+    if (fs_ready) {
+      RNS::Bytes content;
+      if (filesystem.read_file("/destination_table", content) > 0) {
+        TRACE(content.toString() + "\r\n");
+      }
     }
 #endif  // NDEBUG
 
     // CBA Start RNS
-    if (hw_ready) {
+    if (hw_ready && fs_ready) {
       RNS::set_log_callback(&on_log);
       RNS::Transport::set_receive_packet_callback(on_receive_packet);
       RNS::Transport::set_transmit_packet_callback(on_transmit_packet);
@@ -694,12 +678,6 @@ void setup() {
       probe_destination.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
       probe_destination.announce();
       Serial.print("[RNS] Probe destination: "); Serial.println(probe_destination.hash().toHex().c_str());
-
-      // Create telemetry destination
-      telemetry_destination = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "telemetry");
-      telemetry_destination.accepts_links(false);
-      announce_telemetry();
-      Serial.print("[RNS] Telemetry destination: "); Serial.println(telemetry_destination.hash().toHex().c_str());
 
       last_transport_announce = millis();
 
@@ -942,8 +920,9 @@ void ISR_VECT receive_callback(int packet_size) {
         kiss_write_packet();
       #else
         packet_ready = true;
+        last_rx_millis = millis();
       #endif
-    }  
+    }
   } else {
     // In promiscuous mode, raw packets are
     // output directly to the host
@@ -965,6 +944,7 @@ void ISR_VECT receive_callback(int packet_size) {
     #else
       getPacketData(packet_size);
       packet_ready = true;
+      last_rx_millis = millis();
     #endif
   }
 }
@@ -1103,6 +1083,7 @@ void flushQueue(void) {
 #define PHY_HEADER_LORA_SYMBOLS 8
 void add_airtime(uint16_t written) {
   #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    last_tx_millis = millis();
     float packet_cost_ms = 0.0;
     float payload_cost_ms = ((float)written * lora_us_per_byte)/1000.0;
     packet_cost_ms += payload_cost_ms;
@@ -1443,6 +1424,10 @@ void serialCallback(uint8_t sbyte) {
     } else if (command == CMD_RESET) {
       if (sbyte == CMD_RESET_BYTE) {
         hard_reset();
+      }
+    } else if (command == CMD_BOOTLOADER) {
+      if (sbyte == BOOTLOADER_BYTE) {
+        enter_bootloader();
       }
     } else if (command == CMD_ROM_READ) {
       kiss_dump_eeprom();
@@ -1832,6 +1817,13 @@ void validate_status() {
     #endif
     led_indicate_boot_error();
   }
+
+  // Seed activity-watchdog timestamps so the 15-min window starts at boot,
+  // not at epoch zero (which would fire reset immediately).
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    last_rx_millis = millis();
+    last_tx_millis = millis();
+  #endif
 }
 
 void loop() {
@@ -1980,6 +1972,19 @@ void loop() {
       if (config != NULL && config->main_loop_sleep_ms > 0) {
         // FreeRTOS delay() enables tickless idle for power saving
         delay(config->main_loop_sleep_ms);
+      }
+    }
+  #endif
+
+  // No-activity watchdog: hard-reset if modem appears wedged (no TX AND no RX
+  // for NO_ACTIVITY_RESET_MS). Only armed once the radio is online — keeps the
+  // node from self-resetting during console mode or before TNC config is loaded.
+  #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
+    if (radio_online) {
+      unsigned long now = millis();
+      if ((now - last_rx_millis) > NO_ACTIVITY_RESET_MS &&
+          (now - last_tx_millis) > NO_ACTIVITY_RESET_MS) {
+        hard_reset();
       }
     }
   #endif

@@ -17,12 +17,22 @@
 #   --product <hex>   Product code (default: 11)
 #   --model <hex>     Model code (default: 12)
 #   --skip-build      Skip the build step (use existing firmware)
+#   --erase-flash     Build firmware with -DFORMAT_FS_ON_BOOT, which wipes RNS
+#                     routing/cache state (/cache/*, /destination_table) on every
+#                     boot. EEPROM provisioning and identity files are PRESERVED,
+#                     so the node continues to operate as a normal RNode after
+#                     the wipe — no re-provisioning needed.
+#                     Use when RNS path/identity cache becomes corrupt or stale.
+#                     For routine deployment leave it off; the wiper firmware
+#                     wipes routing data on EVERY boot, so the node re-learns
+#                     routes after each power-cycle.
 #   --help            Show this help
 #
 # Examples:
 #   ./flash_xiao_nrf52840.sh
 #   ./flash_xiao_nrf52840.sh --freq 869525000 --bw 250000 --sf 7
 #   ./flash_xiao_nrf52840.sh --skip-build
+#   ./flash_xiao_nrf52840.sh --erase-flash   # one-shot wipe; then re-run normally
 #
 
 set -euo pipefail
@@ -46,6 +56,7 @@ TXP="14"
 PRODUCT="11"
 MODEL="12"
 SKIP_BUILD=false
+ERASE_FLASH=false
 
 PIO_ENV="xiao_nrf52840"
 BUILD_DIR=".pio/build/$PIO_ENV"
@@ -63,7 +74,8 @@ while [[ $# -gt 0 ]]; do
         --product)    PRODUCT="$2"; shift 2 ;;
         --model)      MODEL="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
-        --help|-h)    head -30 "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
+        --erase-flash) ERASE_FLASH=true; shift ;;
+        --help|-h)    head -40 "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
         *)            err "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -110,6 +122,10 @@ echo -e "  Frequency:   $(echo "scale=3; $FREQ/1000000" | bc) MHz"
 echo -e "  Bandwidth:   $(echo "scale=1; $BW/1000" | bc) kHz"
 echo -e "  SF: $SF  CR: $CR  TXP: ${TXP} dBm"
 echo -e "  Product: 0x$PRODUCT  Model: 0x$MODEL"
+if [[ "$ERASE_FLASH" == true ]]; then
+    echo -e "  ${YELLOW}Mode:        WIPER BUILD — wipes RNS /cache + /destination_table${NC}"
+    echo -e "  ${YELLOW}             on every boot. EEPROM + identities preserved.${NC}"
+fi
 echo ""
 
 # ═════════════════════════════════════════════════════════
@@ -127,7 +143,12 @@ if [[ "$SKIP_BUILD" == true ]]; then
 else
     step "Step 1: Building firmware"
     rm -rf "$BUILD_DIR"
-    pio run -e "$PIO_ENV"
+    if [[ "$ERASE_FLASH" == true ]]; then
+        info "Injecting -DFORMAT_FS_ON_BOOT (wiper build)"
+        PLATFORMIO_BUILD_FLAGS="-DFORMAT_FS_ON_BOOT" pio run -e "$PIO_ENV"
+    else
+        pio run -e "$PIO_ENV"
+    fi
     ok "Build complete"
 fi
 
@@ -326,3 +347,12 @@ echo ""
 echo -e "  Verify device:"
 echo -e "    ${CYAN}rnodeconf $SERIAL_PORT -i${NC}"
 echo ""
+if [[ "$ERASE_FLASH" == true ]]; then
+    echo -e "${BOLD}${YELLOW}Note: wiper firmware installed. RNS routing cache + destination_table${NC}"
+    echo -e "${BOLD}${YELLOW}      are wiped on every boot. EEPROM + identities are preserved,${NC}"
+    echo -e "${BOLD}${YELLOW}      so the node operates normally — it just re-learns routes${NC}"
+    echo -e "${BOLD}${YELLOW}      after each power-cycle.${NC}"
+    echo -e "${BOLD}${YELLOW}      For routine deployment, re-flash without --erase-flash so${NC}"
+    echo -e "${BOLD}${YELLOW}      routing cache persists across reboots.${NC}"
+    echo ""
+fi

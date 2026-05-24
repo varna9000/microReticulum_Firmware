@@ -280,53 +280,47 @@ bool device_firmware_ok() {
 
 #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52
 bool device_init() {
-  if (bt_ready) {
-    #if MCU_VARIANT == MCU_ESP32
-    for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=EEPROM.read(eeprom_addr(ADDR_SIGNATURE+i));}
-    mbedtls_md_context_t ctx;
-    mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;     
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0);
-    mbedtls_md_starts(&ctx);
-    #if HAS_BLUETOOTH == true || HAS_BLE == true
-      mbedtls_md_update(&ctx, dev_bt_mac, BT_DEV_ADDR_LEN);
-    #else
-      // TODO: Get from BLE stack instead
-      // mbedtls_md_update(&ctx, dev_bt_mac, BT_DEV_ADDR_LEN);
-    #endif
-    mbedtls_md_update(&ctx, dev_eeprom_signature, EEPROM_SIG_LEN);
-    mbedtls_md_finish(&ctx, dev_hash);
-    mbedtls_md_free(&ctx);
-    #elif MCU_VARIANT == MCU_NRF52
-    for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=eeprom_read(eeprom_addr(ADDR_SIGNATURE+i));}
-    nRFCrypto.begin();
+  #if HAS_BLUETOOTH == true || HAS_BLE == true
+    if (!bt_ready) return false;
+  #endif
 
-    nRFCrypto_Hash hash;
+  #if MCU_VARIANT == MCU_ESP32
+  for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=EEPROM.read(eeprom_addr(ADDR_SIGNATURE+i));}
+  mbedtls_md_context_t ctx;
+  mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0);
+  mbedtls_md_starts(&ctx);
+  #if HAS_BLUETOOTH == true || HAS_BLE == true
+    mbedtls_md_update(&ctx, dev_bt_mac, BT_DEV_ADDR_LEN);
+  #endif
+  mbedtls_md_update(&ctx, dev_eeprom_signature, EEPROM_SIG_LEN);
+  mbedtls_md_finish(&ctx, dev_hash);
+  mbedtls_md_free(&ctx);
+  #elif MCU_VARIANT == MCU_NRF52
+  for (uint8_t i=0; i<EEPROM_SIG_LEN; i++){dev_eeprom_signature[i]=eeprom_read(eeprom_addr(ADDR_SIGNATURE+i));}
+  nRFCrypto.begin();
 
-    hash.begin(CRYS_HASH_SHA256_mode);
+  nRFCrypto_Hash hash;
 
-    #if HAS_BLUETOOTH == true || HAS_BLE == true
-      hash.update(dev_bt_mac, BT_DEV_ADDR_LEN);
-    #else
-      // TODO: Get from BLE stack instead
-      // hash.update(dev_bt_mac, BT_DEV_ADDR_LEN);
-    #endif
-    hash.update(dev_eeprom_signature, EEPROM_SIG_LEN);
+  hash.begin(CRYS_HASH_SHA256_mode);
 
-    hash.end(dev_hash);
-    #endif
-    device_load_signature();
-    device_validate_signature();
+  #if HAS_BLUETOOTH == true || HAS_BLE == true
+    hash.update(dev_bt_mac, BT_DEV_ADDR_LEN);
+  #endif
+  hash.update(dev_eeprom_signature, EEPROM_SIG_LEN);
 
-    device_validate_partitions();
+  hash.end(dev_hash);
+  #endif
+  device_load_signature();
+  device_validate_signature();
 
-    #if MCU_VARIANT == MCU_NRF52
-    nRFCrypto.end();
-    #endif
-    device_init_done = true;
-    return device_init_done && fw_signature_validated;
-  } else {
-    return false;
-  }
+  device_validate_partitions();
+
+  #if MCU_VARIANT == MCU_NRF52
+  nRFCrypto.end();
+  #endif
+  device_init_done = true;
+  return device_init_done && fw_signature_validated;
 }
 #endif

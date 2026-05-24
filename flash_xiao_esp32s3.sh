@@ -5,9 +5,10 @@
 # Flashes via esptool (USB), then provisions ROM and configures radio via rnodeconf.
 #
 # Boot sequence for entering bootloader:
-#   - If our firmware is already running: esptool usb_reset works automatically
-#   - If MicroPython is running: sends machine.bootloader() via REPL
-#   - Last resort: manual BOOT+RESET button combo
+#   1. KISS CMD_BOOTLOADER (0x5A 0xF8) — works if our firmware ≥ v1.73 is running
+#   2. esptool usb_reset — works only if the firmware is hung/silent
+#   3. Manual: hold tiny BOOT button on the XIAO module (under the Wio carrier)
+#      while plugging in USB, then release.
 #
 # Usage:
 #   ./flash_xiao_esp32s3.sh [OPTIONS]
@@ -21,12 +22,17 @@
 #   --product <hex>   Product code (default: 11)
 #   --model <hex>     Model code (default: 13)
 #   --skip-build      Skip the build step (use existing firmware)
+#   --erase-flash     Erase ENTIRE 8 MB flash (LittleFS, EEPROM, identities,
+#                     all caches) before writing firmware. Takes ~30-60 s.
+#                     Use for first deployment or to recover from a corrupted
+#                     filesystem.
 #   --help            Show this help
 #
 # Examples:
 #   ./flash_xiao_esp32s3.sh
 #   ./flash_xiao_esp32s3.sh --freq 869525000 --bw 250000 --sf 7
 #   ./flash_xiao_esp32s3.sh --skip-build
+#   ./flash_xiao_esp32s3.sh --erase-flash   # full wipe + reflash
 #
 
 set -euo pipefail
@@ -50,6 +56,7 @@ TXP="14"
 PRODUCT="12"
 MODEL="13"
 SKIP_BUILD=false
+ERASE_FLASH=false
 
 PIO_ENV="xiao_esp32s3"
 BUILD_DIR=".pio/build/$PIO_ENV"
@@ -66,7 +73,8 @@ while [[ $# -gt 0 ]]; do
         --product)    PRODUCT="$2"; shift 2 ;;
         --model)      MODEL="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=true; shift ;;
-        --help|-h)    head -35 "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
+        --erase-flash) ERASE_FLASH=true; shift ;;
+        --help|-h)    head -40 "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
         *)            err "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -102,6 +110,9 @@ echo -e "  Frequency:   $(echo "scale=3; $FREQ/1000000" | bc) MHz"
 echo -e "  Bandwidth:   $(echo "scale=1; $BW/1000" | bc) kHz"
 echo -e "  SF: $SF  CR: $CR  TXP: ${TXP} dBm"
 echo -e "  Product: 0x$PRODUCT  Model: 0x$MODEL"
+if [[ "$ERASE_FLASH" == true ]]; then
+    echo -e "  ${YELLOW}Mode:        FULL FLASH ERASE — LittleFS, EEPROM, identities will be wiped${NC}"
+fi
 echo ""
 
 # ═════════════════════════════════════════════════════
@@ -119,7 +130,6 @@ if [[ "$SKIP_BUILD" == true ]]; then
 else
     step "Step 1: Building firmware"
     pio run -e "$PIO_ENV"
-    pio run -e "$PIO_ENV" -t buildfs
     ok "Build complete"
 fi
 
@@ -152,83 +162,29 @@ fi
 
 ok "Port: $UPLOAD_PORT"
 
-# Enter bootloader mode. Try multiple strategies:
-info "Entering bootloader mode..."
-BEFORE_MODE="usb_reset"
+# Enter bootloader mode. Strategy order:
+#   1. KISS CMD_BOOTLOADER (works if our firmware ≥ v1.73 is already running)
+#   2. esptool usb_reset (works only if firmware is hung/silent)
+#   3. Manual: tiny BOOT button on XIAO module (under the Wio carrier)
 
-# Try 1: usb_reset (works when our firmware or USB-Serial-JTAG firmware is running)
-if python3 "$ESPTOOL" --chip esp32s3 --port "$UPLOAD_PORT" --before usb_reset chip_id 2>/dev/null; then
-    ok "Connected (usb_reset)"
-else
-    # Try 2: MicroPython bootloader command (fresh boards with MicroPython)
-    info "Trying MicroPython bootloader entry..."
-    python3 -c "
+info "Entering bootloader mode..."
+
+# Try 1: KISS CMD_BOOTLOADER 0x5A 0xF8 — firmware-side download-mode trigger
+info "Sending KISS CMD_BOOTLOADER..."
+python3 -c "
 import serial, time
 try:
     s = serial.Serial('$UPLOAD_PORT', 115200, timeout=1)
-    s.write(b'\x03\x03')
-    time.sleep(0.3)
-    s.write(b'\r\nimport machine; machine.bootloader()\r\n')
+    # FEND CMD_BOOTLOADER BOOTLOADER_BYTE FEND = c0 5a f8 c0
+    s.write(bytes([0xC0, 0x5A, 0xF8, 0xC0]))
+    s.flush()
     time.sleep(0.5)
     s.close()
 except: pass
 " 2>/dev/null
-    sleep 2
+sleep 3
 
-    # Re-detect port after USB re-enumeration
-    UPLOAD_PORT=""
-    for i in {1..10}; do
-        for p in /dev/cu.usbmodem* /dev/ttyACM*; do
-            if [[ -e "$p" ]]; then
-                UPLOAD_PORT="$p"
-                break 2
-            fi
-        done
-        sleep 1
-    done
-
-    if [[ -n "$UPLOAD_PORT" ]] && python3 "$ESPTOOL" --chip esp32s3 --port "$UPLOAD_PORT" --before no_reset chip_id 2>/dev/null; then
-        BEFORE_MODE="no_reset"
-        ok "Connected (MicroPython bootloader)"
-    else
-        # Try 3: manual
-        echo ""
-        echo -e "  ${YELLOW}Auto-reset failed. Enter bootloader manually:${NC}"
-        echo -e "  ${YELLOW}  Hold BOOT (B), press RESET (R), release BOOT${NC}"
-        echo ""
-        read -rp "  Press Enter when done..."
-
-        UPLOAD_PORT=""
-        for i in {1..10}; do
-            for p in /dev/cu.usbmodem* /dev/ttyACM*; do
-                if [[ -e "$p" ]]; then
-                    UPLOAD_PORT="$p"
-                    break 2
-                fi
-            done
-            sleep 1
-        done
-
-        if [[ -z "$UPLOAD_PORT" ]]; then
-            err "No port found."
-            exit 1
-        fi
-        BEFORE_MODE="no_reset"
-        ok "Port: $UPLOAD_PORT"
-    fi
-fi
-
-# Erase flash first for clean slate
-info "Erasing flash..."
-python3 "$ESPTOOL" \
-    --chip esp32s3 \
-    --port "$UPLOAD_PORT" \
-    --before "$BEFORE_MODE" \
-    erase_flash
-
-sleep 2
-
-# Re-detect port after erase (board reboots)
+# Wait for USB re-enumeration into bootloader (PID changes 0x4001 → 0x1001)
 UPLOAD_PORT=""
 for i in {1..10}; do
     for p in /dev/cu.usbmodem* /dev/ttyACM*; do
@@ -240,32 +196,87 @@ for i in {1..10}; do
     sleep 1
 done
 
-if [[ -z "$UPLOAD_PORT" ]]; then
-    err "Port lost after erase."
-    exit 1
+if [[ -n "$UPLOAD_PORT" ]] && python3 "$ESPTOOL" --chip esp32s3 --port "$UPLOAD_PORT" --before no_reset chip_id 2>/dev/null; then
+    ok "In bootloader (via firmware CMD_BOOTLOADER)"
+elif python3 "$ESPTOOL" --chip esp32s3 --port "$UPLOAD_PORT" --before usb_reset chip_id 2>/dev/null; then
+    # Try 2: usb_reset — only works if firmware is hung and not handling USB events
+    ok "In bootloader (via esptool usb_reset)"
+else
+    # Try 3: manual tiny BOOT button on XIAO
+    echo ""
+    echo -e "  ${YELLOW}Auto-entry failed. The firmware isn't responding to KISS commands"
+    echo -e "  and the chip can't be reset programmatically.${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Manual entry — use the tiny BOOT button on the XIAO module"
+    echo -e "  (the one near the USB port, under the Wio carrier):${NC}"
+    echo -e "  ${YELLOW}  1. Unplug USB${NC}"
+    echo -e "  ${YELLOW}  2. Hold BOOT (tiny button on XIAO)${NC}"
+    echo -e "  ${YELLOW}  3. Plug USB in (while holding BOOT)${NC}"
+    echo -e "  ${YELLOW}  4. Release BOOT${NC}"
+    echo ""
+    read -rp "  Press Enter when done..."
+
+    UPLOAD_PORT=""
+    for i in {1..10}; do
+        for p in /dev/cu.usbmodem* /dev/ttyACM*; do
+            if [[ -e "$p" ]]; then
+                UPLOAD_PORT="$p"
+                break 2
+            fi
+        done
+        sleep 1
+    done
+    if [[ -z "$UPLOAD_PORT" ]]; then
+        err "No port found after manual BOOT."
+        exit 1
+    fi
+    ok "Port: $UPLOAD_PORT"
 fi
 
-# Flash bootloader + partitions + firmware + filesystem
+# Optional full erase (wipes LittleFS, EEPROM, identity files, RNS caches —
+# everything). Useful for fresh deployment or recovering from a corrupted FS.
+if [[ "$ERASE_FLASH" == true ]]; then
+    info "Erasing entire 8 MB flash — this takes ~30-60 seconds..."
+    python3 "$ESPTOOL" \
+        --chip esp32s3 \
+        --port "$UPLOAD_PORT" \
+        --before no_reset \
+        --after no_reset \
+        erase_flash
+    ok "Flash erased"
+fi
+
+# Flash bootloader + partitions + firmware (NO littlefs.bin — firmware self-formats
+# the empty spiffs partition on first boot with name_max=255, avoiding the
+# mklittlefs name_max=32 superblock issue).
+#
+# --after no_reset: chip stays in bootloader. User must unplug/replug to boot
+# the new firmware. (--after hard_reset gets stuck in download mode when
+# bootloader was entered manually via BOOT button on USB-Serial-JTAG.)
 info "Flashing firmware..."
 python3 "$ESPTOOL" \
     --chip esp32s3 \
     --port "$UPLOAD_PORT" \
     --baud 460800 \
-    --before usb_reset \
-    --after hard_reset \
+    --before no_reset \
+    --after no_reset \
     write_flash -z \
     --flash_mode dio \
     --flash_freq 80m \
     --flash_size 8MB \
     0x0000 "$BUILD_DIR/bootloader.bin" \
     0x8000 "$BUILD_DIR/partitions.bin" \
-    0x10000 "$BUILD_DIR/$FW_BIN" \
-    0x670000 "$BUILD_DIR/littlefs.bin"
+    0x10000 "$BUILD_DIR/$FW_BIN"
 
 ok "Flash complete"
 
-# Wait for board to reboot
-info "Waiting for board to reboot..."
+# Prompt user to power-cycle so the new firmware actually starts
+echo ""
+echo -e "  ${YELLOW}Now UNPLUG the USB cable, wait 3 seconds, and plug it back in${NC}"
+echo -e "  ${YELLOW}(do NOT hold any button — we want it to boot the new firmware).${NC}"
+echo ""
+read -rp "  Press Enter once you've replugged..."
+info "Waiting for board to boot..."
 sleep 5
 
 # ═════════════════════════════════════════════════════

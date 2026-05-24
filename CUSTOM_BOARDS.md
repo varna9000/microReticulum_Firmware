@@ -1,9 +1,10 @@
 # Custom Board Support
-## Seeed XIAO nRF52840 + Wio-SX1262 / Heltec Wireless Stick Lite V1 / TTGO LoRa32 V1
+## Seeed XIAO nRF52840 / XIAO ESP32-S3 / Heltec Wireless Stick Lite V1 / TTGO LoRa32 V1
 
 | Board | MCU | Radio | Use Case |
 |-------|-----|-------|----------|
 | **Seeed XIAO nRF52840 + Wio-SX1262** | nRF52840 | SX1262 | Low power solar/battery node |
+| **Seeed XIAO ESP32-S3 + Wio-SX1262** | ESP32-S3 | SX1262 | Solar LoRa-only transport node (WiFi/BLE disabled) |
 | **Heltec Wireless Stick Lite V1** | ESP32-PICO-D4 | SX1276 | Compact always-on USB-powered node |
 | **TTGO LoRa32 V1** | ESP32 | SX1276 | General purpose node with OLED display |
 
@@ -86,15 +87,7 @@ When using duty cycle modes, transmitting nodes should use longer preambles (18+
 
 ### LXMF Remote Management (XIAO nRF52840)
 
-The XIAO nRF52840 firmware includes an LXMF endpoint for remote node management. The node announces itself on boot and can be messaged from Sideband or MeshChat. Available commands:
-
-| Command | Example | Description |
-|---------|---------|-------------|
-| `BATTERY` or `BAT` | `BATTERY` | Report battery voltage, percent, and charging state |
-| `ANNOUNCE [min]` or `ANN [min]` | `ANNOUNCE 30` | Show or set announce interval (1–1440 min) |
-| `HELP` | `HELP` | Show command list |
-
-Every LXMF reply includes **Sideband Telemeter-format battery telemetry** (SID 0x04), so Sideband will natively display battery percentage and charging state in its telemetry UI.
+The XIAO nRF52840 firmware includes an LXMF endpoint for remote node management. The node announces itself on boot and can be messaged from Sideband or MeshChat. See [LXMF Remote Control](#lxmf-remote-control--general-information) below for the full command list.
 
 **Battery monitoring:** The firmware reads battery voltage via the onboard ADC and detects charging state using the BQ25101 charger IC's `/CHG` pin (P0.17) combined with the nRF52840 USB power register. Three states are reported: discharging, charging, and charged.
 
@@ -104,7 +97,50 @@ After boot, the LXMF address appears in the serial output. Send commands from Si
 
 ---
 
-## Board 2: Heltec Wireless Stick Lite V1
+## Board 2: Seeed XIAO ESP32-S3 + Wio-SX1262
+
+The same Wio-SX1262 carrier as Board 1, but with the ESP32-S3 variant of the XIAO module — better suited as a solar-powered LoRa-only transport router. WiFi and BLE are disabled in the build; only LoRa is active. The radio uses an SX1262 via B2B connector.
+
+### Hardware Notes
+
+- **Hardware:** XIAO ESP32-S3 plugs into the Wio-SX1262 expansion board (B2B connector — no soldering).
+- **BOOT button is tiny.** The Wio carrier hides the XIAO module's BOOT button (also a tiny pad on top of the XIAO). To enter bootloader manually: hold the XIAO's BOOT pad while plugging in USB. The Wio carrier's user button is **not** BOOT.
+- **Once flashed**, subsequent reflashes can use the firmware's `CMD_BOOTLOADER` KISS command to trigger download mode in software — the flash script attempts this first before falling back to `esptool usb_reset`, then to the physical BOOT pad.
+- **LED is active-low** (GPIO 21). Firmware drives it dark in idle, brief blink on TX/RX activity — minimises battery drain.
+- **TCXO is present** on the Wio-SX1262 and is automatically driven by the SX1262 from DIO3. No external TCXO enable pin needed.
+
+### Build & Flash
+
+```bash
+./flash_xiao_esp32s3.sh
+```
+
+The script builds, attempts software entry to bootloader, falls back to `esptool` reset, flashes, then patches `rnodeconf` and provisions the EEPROM (ROM signature, model, firmware hash) and configures the radio defaults (868.800 MHz, BW 125 kHz, SF 8, CR 5, TX 14 dBm). All flags overridable — see `--help`.
+
+Or manually:
+
+```bash
+uv run pio run -e xiao_esp32s3 -t upload
+```
+
+### Power Optimisation for Solar Operation
+
+The `xiao_esp32s3` build is tuned for solar/battery deployment:
+
+- **WiFi disabled**: never initialised. Library not even pulled in (`HAS_CONSOLE=false` short-circuits `Console.h`).
+- **BLE disabled**: `HAS_BLE=false`. `esp_bt_controller_mem_release(ESP_BT_MODE_BLE)` is called right after `Serial.begin()` in `setup()`, releasing ~30 KB of BT-reserved RAM back to the general heap.
+- **LED inverted** to active-low so the user LED is dark in idle (only blinks on activity).
+- **Loop-task stack raised** to 16 KB (`-DARDUINO_LOOP_STACK_SIZE=16384`) to give RNS recursion headroom; the framework default of 8 KB is tight for transport-mode workloads.
+
+Net effect: at idle the radio is the only RF section drawing power; the LED is dark; ~30 KB more free heap available for RNS routing.
+
+### LXMF Remote Management (XIAO ESP32-S3)
+
+The same LXMF endpoint as the XIAO nRF52840 — see [LXMF Remote Control](#lxmf-remote-control--general-information) below for the command list. Battery globals on this board read 0 because `HAS_PMU=false` and no battery-sensing branch exists for this board in `Power.h`, so the `BATTERY` command will reply `Battery: not available`. `ANNOUNCE`, `DUTY`, and `HELP` all work normally.
+
+---
+
+## Board 3: Heltec Wireless Stick Lite V1
 
 An all-in-one ESP32 + SX1276 board — just connect an antenna and a Micro-USB cable.
 
@@ -156,45 +192,17 @@ Or use the interactive installer:
 uv run rnodeconf /dev/ttyUSB0 --autoinstall    # select [17] Heltec Wireless Stick Lite V1
 ```
 
-### GPIO Control (Heltec WSL V1)
+### Pin Reference
 
-The Heltec WSL V1 has a good selection of free GPIO pins since there is no display.
+**Used by the radio (do not reassign):** 5 (SCK), 14 (Reset), 18 (CS), 19 (MISO), 25 (LED), 26 (DIO), 27 (MOSI).
 
-**Pins used by the radio (do not reassign):** 5 (SCK), 14 (Reset), 18 (CS), 19 (MISO), 25 (LED), 26 (DIO), 27 (MOSI).
+Free GPIOs (for forks that want to re-add pin control): 12, 13, 17, 23, 32, 33, 34 (input-only), 35 (input-only), 36 (input-only), 39 (input-only).
 
-| Pin | Direction | Notes |
-|-----|-----------|-------|
-| 12  | I/O       | |
-| 13  | I/O       | |
-| 17  | I/O       | |
-| 23  | I/O       | |
-| 32  | I/O       | |
-| 33  | I/O       | |
-| 34  | Input only | no internal pull-up |
-| 35  | Input only | no internal pull-up |
-| 36  | Input only | no internal pull-up |
-| 39  | Input only | no internal pull-up |
+### Build & Flash
 
 **Step 1 — Apply the FileSystem.cpp patch.** All ESP32-based boards require the patched `FileSystem.cpp` from this repo. See [FileSystem.cpp Patch](#filesystemcpp-patch-esp32-boards) for details on what it fixes.
 
-**Step 2 — Edit the pin table.** Open `GPIO_Control.h` and replace the default `gpio_pins[]` array with:
-
-```cpp
-static GPIOPin gpio_pins[] = {
-    { 12, true,  false, INPUT, "GP12" },
-    { 13, true,  false, INPUT, "GP13" },
-    { 17, true,  false, INPUT, "GP17" },
-    { 23, true,  false, INPUT, "GP23" },
-    { 32, true,  false, INPUT, "GP32" },
-    { 33, true,  false, INPUT, "GP33" },
-    { 34, false, false, INPUT, "GP34 input-only" },
-    { 35, false, false, INPUT, "GP35 input-only" },
-    { 36, false, false, INPUT, "GP36 input-only" },
-    { 39, false, false, INPUT, "GP39 input-only" },
-};
-```
-
-**Step 3 — Enable RNS and GPIO control in platformio.ini.** The default `heltec_wsl_v1` environment has RNS disabled. Enable it along with GPIO control:
+**Step 2 — Enable RNS and the LXMF endpoint in platformio.ini.** The default `heltec_wsl_v1` environment has RNS disabled. Enable it along with the LXMF command endpoint (`HAS_GPIO_CONTROL` is the historical flag name; it now gates only the LXMF text-command endpoint, not any pin toggling):
 
 ```ini
 [env:heltec_wsl_v1]
@@ -220,7 +228,7 @@ lib_deps =
 
 > **Note:** RNS was previously disabled on this board due to a heap corruption crash. This was caused by the double-free bug in `FileSystem.cpp`, which the patched version fixes. With the patch applied, RNS runs stable.
 
-**Step 4 — Build, flash, and provision.**
+**Step 3 — Build, flash, and provision.**
 
 ```bash
 rm -rf .pio/build
@@ -237,36 +245,25 @@ uv run rnodeconf --firmware-hash $(shasum -a 256 \
   .pio/build/heltec_wsl_v1/*.bin | cut -d' ' -f1) /dev/ttyUSB0
 ```
 
-After boot, the LXMF address will appear in the serial output. Send commands from Sideband using **opportunistic** delivery.
+After boot, the LXMF address will appear in the serial output. Send commands from Sideband using **opportunistic** delivery — see [LXMF Remote Control](#lxmf-remote-control--general-information) for the command list.
 
 ---
 
-## Board 3: TTGO LoRa32 V1
+## Board 4: TTGO LoRa32 V1
 
-An ESP32 board with built-in SX1276 radio and 0.96" OLED display. Widely available and well-suited for GPIO control with the most free pins of the three boards.
+An ESP32 board with built-in SX1276 radio and 0.96" OLED display. Widely available, USB-powered, well-suited as a general-purpose RNS transport node with a visible status display.
 
-### GPIO Control (TTGO LoRa32 V1)
+### Pin Reference
 
-**Pins used by the radio and display (do not reassign):** 2 (LED), 4 (OLED SDA), 5 (SCK), 14 (Reset), 15 (OLED SCL), 16 (OLED RST), 18 (CS), 19 (MISO), 26 (DIO), 27 (MOSI).
+**Used by the radio and display (do not reassign):** 2 (LED), 4 (OLED SDA), 5 (SCK), 14 (Reset), 15 (OLED SCL), 16 (OLED RST), 18 (CS), 19 (MISO), 26 (DIO), 27 (MOSI).
 
-| Pin | Direction | Notes |
-|-----|-----------|-------|
-| 13  | I/O       | |
-| 17  | I/O       | |
-| 23  | I/O       | |
-| 25  | I/O       | |
-| 32  | I/O       | |
-| 33  | I/O       | |
-| 34  | Input only | no internal pull-up |
-| 35  | Input only | no internal pull-up |
-| 36  | Input only | no internal pull-up |
-| 39  | Input only | no internal pull-up |
+Free GPIOs (for forks that want to re-add pin control): 13, 17, 23, 25, 32, 33, 34 (input-only), 35 (input-only), 36 (input-only), 39 (input-only).
+
+### Build & Flash
 
 **Step 1 — Apply the FileSystem.cpp patch.** All ESP32-based boards require the patched `FileSystem.cpp` from this repo. See [FileSystem.cpp Patch](#filesystemcpp-patch-esp32-boards) for details on what it fixes.
 
-**Step 2 — Edit the pin table (optional).** The default `gpio_pins[]` array in `GPIO_Control.h` is already configured for the TTGO LoRa32 v1 — no changes needed unless you want to add or remove pins.
-
-**Step 3 — The platformio.ini environment.** The `ttgo-lora32-v1` environment already has GPIO control enabled:
+**Step 2 — Verify the platformio.ini environment.** The `ttgo-lora32-v1` environment already enables the LXMF command endpoint and raises the loop-task stack to 16 KB (`HAS_GPIO_CONTROL` is the historical flag name; it now gates only the LXMF text-command endpoint, not any pin toggling):
 
 ```ini
 [env:ttgo-lora32-v1]
@@ -288,7 +285,7 @@ lib_deps =
 	https://github.com/attermann/microReticulum.git
 ```
 
-**Step 4 — Build, flash, and provision.**
+**Step 3 — Build, flash, and provision.**
 
 ```bash
 rm -rf .pio/build
@@ -306,7 +303,7 @@ uv run rnodeconf --firmware-hash $(shasum -a 256 \
   /dev/cu.usbserial-0001
 ```
 
-After boot, the LXMF address will appear in the serial output. Send commands from Sideband using **opportunistic** delivery.
+After boot, the LXMF address will appear in the serial output. Send commands from Sideband using **opportunistic** delivery — see [LXMF Remote Control](#lxmf-remote-control--general-information) for the command list.
 
 ---
 
@@ -314,40 +311,28 @@ After boot, the LXMF address will appear in the serial output. Send commands fro
 
 The firmware runs a minimal LXMF endpoint alongside the RNode TNC, allowing remote management via [Sideband](https://github.com/markqvist/Sideband) or MeshChat. When a message arrives, it parses the text command, performs the operation, and sends a reply. The node announces its LXMF address on boot, so apps can discover it automatically.
 
-Every reply includes Sideband Telemeter-format battery telemetry, so Sideband natively displays battery data in its telemetry UI.
-
 ### Delivery Mode
 
 Always use **opportunistic** delivery in Sideband. Direct delivery requires a full Reticulum Link handshake which is too resource-intensive for microcontrollers over LoRa.
 
-### Commands (XIAO nRF52840)
+### Commands
+
+The same command set is supported on every board that has `HAS_GPIO_CONTROL` enabled (XIAO nRF52840, XIAO ESP32-S3, Heltec WSL V1, TTGO LoRa32 V1). Commands are case-insensitive; short aliases are noted in parentheses.
 
 | Command | Example | Description |
 |---------|---------|-------------|
-| `BATTERY` | `BATTERY` | Battery voltage, percent, and charging state |
-| `ANNOUNCE [min]` | `ANNOUNCE 30` | Show or set announce interval |
-| `HELP` | `HELP` | Show command list |
+| `BATTERY` (`BAT`) | `BATTERY` | Battery voltage, percent, and charging state. Replies `Battery: not available` on boards without a battery-sensing branch (e.g. XIAO ESP32-S3). |
+| `ANNOUNCE [min]` (`ANN`) | `ANNOUNCE 30` | Show or set both the LXMF endpoint and transport-probe announce intervals (1–1440 min). Session-only — does not persist across reboots. |
+| `DUTY [ON [pct] \| OFF]` (`DC`) | `DUTY ON 1`, `DUTY OFF`, `DUTY` | Enable or disable the EU duty-cycle airtime limit, or report current state. `DUTY ON` enables with 1% long-term default (EU 868 MHz baseline); supply a percentage to override. `DUTY OFF` removes both short-term and long-term enforcement. Session-only. **Caveat:** running with `OFF` in EU regulatory territory is on you. |
+| `HELP` (`?`) | `HELP` | Show command list |
 
-### Commands (ESP32 boards — TTGO, Heltec)
-
-ESP32 boards additionally support GPIO pin control:
-
-| Command | Example | Description |
-|---------|---------|-------------|
-| `SET <pin> HIGH\|LOW` | `SET 13 HIGH` | Set output pin high or low (also accepts `ON`/`OFF`/`1`/`0`) |
-| `GET <pin>` | `GET 32` | Read current pin state |
-| `MODE <pin> IN\|OUT` | `MODE 12 OUT` | Set pin direction |
-| `PINS` | `PINS` | List all available GPIO pins |
-| `STATUS` | `STATUS` | Report states of all configured pins |
-| `BATTERY` | `BATTERY` | Battery voltage, percent, and charging state |
-| `ANNOUNCE [min]` | `ANNOUNCE 30` | Show or set announce interval |
-| `HELP` | `HELP` | Show command list |
+Earlier revisions also exposed `SET`/`GET`/`MODE`/`PINS`/`STATUS` for direct GPIO pin toggling. Those were removed in commit `4a0df60` because they were too easy to misuse remotely — every transport node now exposes the same query/control surface.
 
 ### Required Files
 
 | File | Purpose |
 |------|---------|
-| `GPIO_Control.h` | Command parser and pin control logic |
+| `GPIO_Control.h` | LXMF text-command parser (BATTERY, ANNOUNCE, DUTY, HELP) — name is historical; no GPIO pin toggling code remains |
 | `LXMF_Minimal.h` | Lightweight LXMF send/receive |
 | `FileSystem.cpp` | Patched filesystem layer (ESP32 only — see below) |
 
@@ -373,8 +358,9 @@ If you haven't already replaced `FileSystem.cpp`, copy the patched version from 
 
 | Script | Purpose |
 |--------|---------|
-| `xiao_rnode_setup.py` | All-in-one XIAO setup wizard (build, flash, provision, configure) |
-| `flash_xiao_nrf52840.sh` | Build & flash XIAO firmware with optional provisioning |
+| `xiao_rnode_setup.py` | All-in-one XIAO nRF52840 setup wizard (build, flash, provision, configure) |
+| `flash_xiao_nrf52840.sh` | Build & flash XIAO nRF52840 firmware with optional provisioning |
+| `flash_xiao_esp32s3.sh` | Build & flash XIAO ESP32-S3 firmware; software-triggered bootloader entry + EEPROM provisioning |
 | `flash_wsl_v1.sh` | Build & flash Heltec WSL V1 firmware |
 | `flash_ttgo_v1.sh` | Build & flash TTGO LoRa32 v1 with GPIO control |
 | `patch_rnodeconf_hwsl_v1.py` | Patch rnodeconf to recognize HWSL V1 (product, models, autoinstall) |
@@ -388,24 +374,32 @@ All Python scripts should be run via `uv run` to use the managed dependencies. I
 
 | File | Change |
 |------|--------|
-| `Boards.h` | Added `BOARD_XIAO_NRF52840` and `BOARD_HWSL_V1` definitions |
+| `Boards.h` | Added `BOARD_XIAO_NRF52840`, `BOARD_XIAO_ESP32S3`, and `BOARD_HWSL_V1` definitions. XIAO ESP32-S3 block disables WiFi/BLE/PMU/display (LoRa-only solar profile). |
 | `sx126x.h` / `sx126x.cpp` | SX1262 RX duty cycle for power optimization |
-| `LowPower.h` / `LowPower.cpp` | New power management module (XIAO only) |
-| `Bluetooth.h` | Power-optimized BLE advertising intervals |
+| `LowPower.h` / `LowPower.cpp` | New power management module (XIAO nRF52840 only) |
+| `Bluetooth.h` | Power-optimized BLE advertising intervals (nRF52840). On XIAO ESP32-S3 the entire header is elided because `HAS_BLUETOOTH=false` and `HAS_BLE=false`. |
 | `Config.h` | Low power configuration constants |
-| `RNode_Firmware.ino` | Event-driven loop with sleep support, heap diagnostics |
-| `platformio.ini` | Added `xiao_nrf52840`, `xiao_nrf52840_lowpower`, `heltec_wsl_v1`, and `ttgo-lora32-v1` build environments |
+| `Device.h` | `device_init()` `bt_ready` precondition gated by `#if HAS_BLUETOOTH \|\| HAS_BLE` so boards with BT disabled (e.g. XIAO ESP32-S3 solar profile) still pass hardware validation. |
+| `Utilities.h` | XIAO ESP32-S3 user LED (GPIO 21) declared active-low; LED is explicitly turned off after `pinMode` so it boots dark. |
+| `RNode_Firmware.ino` | Event-driven loop with sleep support, heap diagnostics. For XIAO ESP32-S3: `esp_bt_controller_mem_release(ESP_BT_MODE_BLE)` after `Serial.begin()` returns ~30 KB to the heap; board name added to the boot banner. |
+| `platformio.ini` | Added `xiao_nrf52840`, `xiao_nrf52840_lowpower`, `xiao_esp32s3`, `heltec_wsl_v1`, and `ttgo-lora32-v1` build environments. XIAO ESP32-S3 env raises loop-task stack to 16 KB (`-DARDUINO_LOOP_STACK_SIZE=16384`) for RNS recursion headroom. |
 | `pyproject.toml` | Python dependencies for `uv sync` |
 | `FileSystem.cpp` | Fixed double-free, cache directory, `create=true`, filename truncation, nRF52840 FS corruption guard |
-| `GPIO_Control.h` | New — LXMF-based remote control (battery, announce, GPIO on ESP32) |
-| `LXMF_Minimal.h` | New — lightweight LXMF message handling with Sideband Telemeter telemetry |
+| `GPIO_Control.h` | LXMF text-command endpoint — `BATTERY`, `ANNOUNCE`, `DUTY`, `HELP`. (No GPIO pin toggling code; that was removed in commit `4a0df60`. File name is historical.) |
+| `LXMF_Minimal.h` | Lightweight LXMF send/receive. Sideband Telemeter battery payload builder and auto-attach-to-every-reply removed — replies are now plain text only. |
 | `Power.h` | Fixed XIAO nRF52840 battery voltage divider and BQ25101 charging detection |
 
 ---
 
 ## Troubleshooting
 
-**XIAO won't enter bootloader:** Double-tap the tiny reset button quickly. A USB drive should appear.
+**XIAO nRF52840 won't enter bootloader:** Double-tap the tiny reset button quickly. A USB mass-storage drive should appear.
+
+**XIAO ESP32-S3 won't enter bootloader:** The Wio-SX1262 carrier hides the XIAO's tiny BOOT pad — the carrier's user button is **not** BOOT. Hold the XIAO module's BOOT pad while plugging in USB. Once a firmware build with `CMD_BOOTLOADER` (KISS 0x5A 0xF8) is flashed, subsequent reflashes can be triggered in software via `flash_xiao_esp32s3.sh` without touching the pad.
+
+**XIAO ESP32-S3 boots but `[RNode] Op mode: Normal` and `RNS is inoperable because hardware is not ready!`:** Either the EEPROM provisioning is missing (run the flash script which provisions automatically), or you're on an old build where `device_init()` required `bt_ready=true` even when BLE was disabled. Fixed in `Device.h`: the `bt_ready` precondition is now gated by `#if HAS_BLUETOOTH || HAS_BLE`.
+
+**XIAO ESP32-S3 LED stays on:** Old behavior — the LED was treated as active-high (it's actually active-low). Reflash with the current firmware; the LED is now dark in idle and only blinks on TX/RX activity.
 
 **"eeprom hardware config invalid" after flash:** Run `provision_xiao.py` or the setup wizard — the EEPROM needs to be written before the device will operate.
 

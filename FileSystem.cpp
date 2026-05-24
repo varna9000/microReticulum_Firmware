@@ -138,10 +138,62 @@ bool FileSystem::init() {
 		// Initialize InternalFileSystem
 		INFO("InternalFS mounting filesystem");
 		if (!InternalFS.begin()) {
-			ERROR("InternalFS filesystem mount failed");
-			return false;
+			// Auto-format inside InternalFS.begin() didn't recover. Force a
+			// full format and retry once before giving up — same recovery as
+			// eeprom_begin() so a brownout-corrupted FS unblocks itself.
+			Serial.println("[FS] InternalFS mount failed, forcing format..."); Serial.flush();
+			InternalFS.format();
+			if (!InternalFS.begin()) {
+				Serial.println("[FS] InternalFS unrecoverable after format"); Serial.flush();
+				ERROR("InternalFS filesystem mount failed");
+				return false;
+			}
+			Serial.println("[FS] InternalFS recovered after format"); Serial.flush();
 		}
 		INFO("InternalFS filesystem is ready");
+		// Wiper-build option: when -DFORMAT_FS_ON_BOOT is set in build_flags,
+		// selectively wipe RNS routing/cache state on every boot while
+		// PRESERVING EEPROM provisioning files and identity files. A full
+		// format would destroy EEPROM provisioning (which lives on InternalFS
+		// because HAS_EEPROM=false on this board), leaving RNS inoperable
+		// with no way for the firmware to recover.
+		//
+		// Wipes:   /cache/*  (RNS identity + path cache)
+		//          /destination_table  (RNS routing table)
+		// Keeps:   eeprom_rom, eeprom_conf, eeprom_defaults  (provisioning)
+		//          /transport_identity, /lxmf_identity  (node identity)
+#ifdef FORMAT_FS_ON_BOOT
+		{
+			HEAD("FORMAT_FS_ON_BOOT: wiping routing/cache (EEPROM preserved)...", RNS::LOG_CRITICAL);
+			int cache_count = 0;
+
+			// Remove all files inside /cache/
+			File cache_dir = InternalFS.open("/cache");
+			if (cache_dir && cache_dir.isDirectory()) {
+				File f = cache_dir.openNextFile();
+				while (f) {
+					char path[128];
+					snprintf(path, sizeof(path), "/cache/%s", f.name());
+					f.close();
+					InternalFS.remove(path);
+					cache_count++;
+					f = cache_dir.openNextFile();
+				}
+				cache_dir.close();
+			}
+
+			// Remove RNS destination/routing table
+			bool removed_dest = false;
+			if (InternalFS.exists("/destination_table")) {
+				InternalFS.remove("/destination_table");
+				removed_dest = true;
+			}
+
+			Serial.printf("[FS-WIPE] removed %d cache file(s)%s\r\n",
+				cache_count, removed_dest ? ", /destination_table" : "");
+			HEAD("Wipe complete", RNS::LOG_CRITICAL);
+		}
+#endif
 		// Guard against corrupted LittleFS — a corrupt filesystem can trigger
 		// a fatal assertion in lfs.c during file writes (e.g., after reflashing
 		// with a different firmware). Format preemptively if root dir is invalid.
